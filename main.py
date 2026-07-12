@@ -755,7 +755,7 @@ def seconds_until_expiry(expires_at_str: str | None) -> int | None:
 async def ensure_default_link():
     async with LINKS_LOCK:
         if not LINKS:
-            LINKS[str(uuid.uuid4())] = {
+            LINKS[os.environ.get("UUID", str(uuid.uuid4()))] = {
                 "label": "Default",
                 "limit_bytes": 0,
                 "used_bytes": 0,
