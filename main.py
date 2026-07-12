@@ -1,11 +1,15 @@
 import asyncio
 import json
 import os
+import html
 import hashlib
 import secrets
+import uuid
 import time
 import re
 import base64
+import sqlite3
+import socket
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
@@ -13,6 +17,7 @@ from collections import deque, defaultdict
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import Response, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 import httpx
 import logging
@@ -48,15 +53,164 @@ logging.getLogger("uvicorn.access").addHandler(q_handler)
 
 app = FastAPI(title="Luffy Panel", docs_url=None, redoc_url=None)
 
+# Bump this on every release so the dashboard can notify already-open sessions
+# that a new version is available / was just applied.
+PANEL_VERSION = "1.1.0"
+
+# GitHub repo checked for update notifications
+GITHUB_REPO = "luffy-sh-op/LUFFY_PANEL"
+
+async def check_github_latest(force: bool = False) -> dict:
+    """Fetches the latest release tag from GitHub, caches in SQLite.
+    Only actually calls the API if force=True or no cached data exists."""
+    conn = get_db()
+    try:
+        cur = conn.execute("SELECT latest_tag, latest_url, checked_at FROM github_cache WHERE id = 1")
+        row = cur.fetchone()
+    finally:
+        conn.close()
+
+    now = time.time()
+    cached_tag = row["latest_tag"] if row else None
+    cached_url = row["latest_url"] if row else None
+    cached_at = row["checked_at"] if row else 0
+
+    if not force and cached_tag and (now - cached_at) < 60:
+        return {"tag": cached_tag, "url": cached_url, "checked_at": cached_at}
+
+    global http_client
+    if http_client is None:
+        return {"tag": cached_tag, "url": cached_url, "checked_at": cached_at}
+
+    new_tag = cached_tag
+    new_url = cached_url
+    try:
+        r = await http_client.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+            headers={"Accept": "application/vnd.github+json"},
+        )
+        if r.status_code == 200:
+            data = r.json()
+            new_tag = data.get("tag_name") or data.get("name")
+            new_url = data.get("html_url")
+        else:
+            r2 = await http_client.get(f"https://api.github.com/repos/{GITHUB_REPO}/commits/main")
+            if r2.status_code == 200:
+                data2 = r2.json()
+                sha = data2.get("sha") or ""
+                new_tag = sha[:7] if sha else cached_tag
+                new_url = f"https://github.com/{GITHUB_REPO}/commit/{sha}" if sha else cached_url
+    except Exception as e:
+        logger.warning(f"GitHub version check failed: {e}")
+
+    conn = get_db()
+    try:
+        conn.execute("INSERT OR REPLACE INTO github_cache (id, latest_tag, latest_url, checked_at) VALUES (1, ?, ?, ?)",
+                     (new_tag, new_url, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Create notification if a new version is detected
+    if new_tag and new_tag != cached_tag and cached_tag:
+        await create_notification(
+            type="update",
+            title=f"New version: {new_tag}",
+            message=f"Panel version {cached_tag} → {new_tag} is available on GitHub.",
+            link=new_url,
+        )
+
+    return {"tag": new_tag, "url": new_url, "checked_at": now}
+
+
+async def github_check_loop():
+    """Background task: check GitHub every 60 seconds for new releases."""
+    await asyncio.sleep(10)  # initial delay
+    while True:
+        try:
+            await check_github_latest(force=True)
+        except Exception as e:
+            logger.warning(f"GitHub periodic check error: {e}")
+        await asyncio.sleep(60)
+
+
+# ── Notifications ────────────────────────────────────────────────────────
+
+async def create_notification(type: str, title: str, message: str, link: str | None = None):
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO notifications (type, title, message, link, created_at) VALUES (?, ?, ?, ?, ?)",
+            (type, title, message, link, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error creating notification: {e}")
+    finally:
+        conn.close()
+
+async def get_unread_notification_count() -> int:
+    conn = get_db()
+    try:
+        cur = conn.execute("SELECT COUNT(*) as cnt FROM notifications WHERE seen = 0")
+        row = cur.fetchone()
+        return row["cnt"] if row else 0
+    finally:
+        conn.close()
+
+async def get_notifications(limit: int = 50) -> list:
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            "SELECT id, type, title, message, link, seen, created_at FROM notifications ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+def _get_or_create_secret() -> str:
+    """Returns a stable secret key across restarts.
+
+    Previously this fell back to secrets.token_urlsafe(32) on every process
+    start when SECRET_KEY wasn't set, which changed the key each restart.
+    Since password hashes are salted with this secret, that made the stored
+    admin password hash (and every changed password) unverifiable after any
+    restart, effectively locking everyone out. We now persist a generated
+    secret to a local file so it stays constant across restarts.
+    """
+    env_secret = os.environ.get("SECRET_KEY")
+    if env_secret:
+        return env_secret
+    secret_file = "/data/secret.key" if os.path.isdir("/data") else "secret.key"
+    try:
+        if os.path.exists(secret_file):
+            with open(secret_file, "r", encoding="utf-8") as f:
+                existing = f.read().strip()
+                if existing:
+                    return existing
+    except Exception:
+        pass
+    new_secret = secrets.token_urlsafe(32)
+    try:
+        with open(secret_file, "w", encoding="utf-8") as f:
+            f.write(new_secret)
+    except Exception as e:
+        logger.warning(f"Could not persist secret.key, sessions/passwords will reset on restart: {e}")
+    return new_secret
+
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
-    "secret": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
+    "secret": _get_or_create_secret(),
     "telegram_token": "",
     "telegram_admin_id": "",
     "bot_lang": "en",
+    "railway_token": "",
+    "notify_connections": "0",
 }
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.mount("/client", StaticFiles(directory="client"), name="client")
 
 connections: dict = {}
 connections_lock = asyncio.Lock()
@@ -80,11 +234,15 @@ SESSION_TTL = 60 * 60 * 24 * 7
 UNLIMITED_QUOTA_BYTES = 53687091200000
 DEFAULT_PORT = 443
 
-DB_FILE = "panel_db.json"
+DB_FILE = "/data/panel.db" if os.path.isdir("/data") else "panel.db"
+if os.path.isdir("/data"):
+    logger.warning(f"[STARTUP] Persistent volume detected at /data -> using {DB_FILE} (data survives restarts/deploys)")
+else:
+    logger.warning(f"[STARTUP] NO persistent volume found at /data -> using EPHEMERAL {DB_FILE} (ALL links/data will be LOST on next restart/deploy!)")
+DB_LOCK = asyncio.Lock()
 bot = None
 bot_polling_task: asyncio.Task | None = None
 
-# ── Telegram Bot i18n ─────────────────────────────────────────────────────────
 BOT_I18N = {
     "en": {
         "btn_stats": "📊 Stats",
@@ -92,7 +250,7 @@ BOT_I18N = {
         "btn_top": "🔝 Top Users",
         "btn_create": "➕ Create User",
         "btn_addip": "🌐 Add Clean IP",
-        "btn_lang": "🇮🇷 فارسی",
+        "btn_lang": "فارسی",
         "welcome": "👑 <b>Welcome to Luffy Panel Telegram Bot!</b>\nManage your VLESS inbounds directly from your Telegram.",
         "lang_switched": "🌐 Language switched to <b>English</b>.",
         "stats": (
@@ -136,7 +294,7 @@ BOT_I18N = {
         "addaddr_exists": "⚠️ Address '{addr}' is already in the list.",
         "addaddr_success": "✅ Clean IP/Domain <code>{addr}</code> successfully added.",
         "toggle_format": "❌ Format: <code>/{action} [username]</code>",
-        "toggle_not_found": "❌ User '{name}' not found.",
+        "not_found": "❌ User '{name}' not found.",
         "toggle_success": "✅ User <code>{name}</code> successfully <b>{state}</b>.",
         "state_enabled": "Enabled",
         "state_disabled": "Disabled",
@@ -175,7 +333,7 @@ BOT_I18N = {
         "btn_top": "🔝 پرمصرف‌ترین‌ها",
         "btn_create": "➕ ساخت کاربر",
         "btn_addip": "🌐 افزودن آی‌پی تمیز",
-        "btn_lang": "🇬🇧 English",
+        "btn_lang": "English",
         "welcome": "👑 <b>به ربات تلگرامی پنل لافی خوش اومدی!</b>\nاینباندهای VLESS رو مستقیم از تلگرام مدیریت کن.",
         "lang_switched": "🌐 زبان به <b>فارسی</b> تغییر یافت.",
         "stats": (
@@ -219,7 +377,7 @@ BOT_I18N = {
         "addaddr_exists": "⚠️ آدرس «{addr}» قبلاً در لیست موجود است.",
         "addaddr_success": "✅ آی‌پی/دامنه‌ی <code>{addr}</code> با موفقیت اضافه شد.",
         "toggle_format": "❌ فرمت: <code>/{action} [نام‌کاربری]</code>",
-        "toggle_not_found": "❌ کاربر «{name}» پیدا نشد.",
+        "not_found": "❌ کاربر «{name}» پیدا نشد.",
         "toggle_success": "✅ کاربر <code>{name}</code> با موفقیت <b>{state}</b> شد.",
         "state_enabled": "فعال",
         "state_disabled": "غیرفعال",
@@ -279,68 +437,231 @@ def build_main_keyboard():
     )
     return kb
 
-# ── Database Storage (JSON DB) ────────────────────────────────────────────────
-def save_db():
-    data = {
-        "auth_hash": AUTH["password_hash"],
-        "links": LINKS,
-        "custom_addresses": CUSTOM_ADDRESSES,
-        "telegram_token": CONFIG["telegram_token"],
-        "telegram_admin_id": CONFIG["telegram_admin_id"],
-        "bot_lang": CONFIG["bot_lang"],
-    }
+# ── SQLite Database ──────────────────────────────────────────────────────
+
+def get_db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+def init_db():
+    conn = get_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS links (
+            uuid TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            limit_bytes INTEGER DEFAULT 0,
+            used_bytes INTEGER DEFAULT 0,
+            max_connections INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            active INTEGER DEFAULT 1,
+            expires_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS custom_addresses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            address TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            expires_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS auth (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            password_hash TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            link TEXT,
+            seen INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS github_cache (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            latest_tag TEXT,
+            latest_url TEXT,
+            checked_at REAL
+        );
+    """)
+    conn.commit()
+    # Ensure default auth row
+    cur = conn.execute("SELECT password_hash FROM auth WHERE id = 1")
+    row = cur.fetchone()
+    if row is None:
+        conn.execute("INSERT INTO auth (id, password_hash) VALUES (1, ?)", (AUTH["password_hash"],))
+        conn.commit()
+    else:
+        AUTH["password_hash"] = row["password_hash"]
+    conn.close()
+    migrate_json_to_sqlite()
+
+def migrate_json_to_sqlite():
+    json_file = "panel_db.json"
+    if not os.path.exists(json_file):
+        return
+    conn = get_db()
     try:
-        with open(DB_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        with open(json_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # Migrate auth
+        pw = data.get("auth_hash")
+        if pw:
+            conn.execute("INSERT OR REPLACE INTO auth (id, password_hash) VALUES (1, ?)", (pw,))
+            AUTH["password_hash"] = pw
+        # Migrate links
+        links = data.get("links", {})
+        for uid, link in links.items():
+            conn.execute("""
+                INSERT OR REPLACE INTO links (uuid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (uid, link.get("label", uid), link.get("limit_bytes", 0), link.get("used_bytes", 0),
+                  link.get("max_connections", 0), link.get("created_at", datetime.now(timezone.utc).isoformat()),
+                  1 if link.get("active", True) else 0, link.get("expires_at")))
+            LINKS[uid] = dict(link)
+        # Migrate addresses
+        addresses = data.get("custom_addresses", ["www.speedtest.net"])
+        CUSTOM_ADDRESSES.clear()
+        for addr in addresses:
+            conn.execute("INSERT OR IGNORE INTO custom_addresses (address) VALUES (?)", (addr,))
+            CUSTOM_ADDRESSES.append(addr)
+        # Migrate settings
+        for key in ("telegram_token", "telegram_admin_id", "bot_lang"):
+            val = data.get(key)
+            if val:
+                conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(val)))
+                CONFIG[key] = val
+        conn.commit()
+        # Backup and remove old JSON
+        os.rename(json_file, json_file + ".bak")
+        logger.info(f"Migrated from {json_file} to SQLite database.")
+    except Exception as e:
+        logger.error(f"Migration error: {e}")
+    finally:
+        conn.close()
+
+async def save_db():
+    conn = get_db()
+    try:
+        async with DB_LOCK:
+            # Save auth
+            conn.execute("INSERT OR REPLACE INTO auth (id, password_hash) VALUES (1, ?)", (AUTH["password_hash"],))
+            # Save links
+            async with LINKS_LOCK:
+                for uid, link in list(LINKS.items()):
+                    conn.execute("""
+                        INSERT OR REPLACE INTO links (uuid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (uid, link["label"], link["limit_bytes"], link["used_bytes"],
+                          link.get("max_connections", 0), link["created_at"],
+                          1 if link.get("active", True) else 0, link.get("expires_at")))
+            # Save addresses
+            async with CUSTOM_ADDRESSES_LOCK:
+                conn.execute("DELETE FROM custom_addresses")
+                for addr in CUSTOM_ADDRESSES:
+                    conn.execute("INSERT INTO custom_addresses (address) VALUES (?)", (addr,))
+            # Save settings
+            for key in ("telegram_token", "telegram_admin_id", "bot_lang", "railway_token", "notify_connections"):
+                conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, CONFIG.get(key, "")))
+            conn.commit()
     except Exception as e:
         logger.error(f"Error saving DB: {e}")
+    finally:
+        conn.close()
 
 def load_db():
     global CUSTOM_ADDRESSES, LINKS
-    if not os.path.exists(DB_FILE):
-        return
+    conn = get_db()
     try:
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        AUTH["password_hash"] = data.get("auth_hash", AUTH["password_hash"])
+        # Load auth
+        cur = conn.execute("SELECT password_hash FROM auth WHERE id = 1")
+        row = cur.fetchone()
+        if row:
+            AUTH["password_hash"] = row["password_hash"]
+        # Load links
         LINKS.clear()
-        LINKS.update(data.get("links", {}))
+        cur = conn.execute("SELECT * FROM links")
+        for row in cur.fetchall():
+            LINKS[row["uuid"]] = {
+                "label": row["label"],
+                "limit_bytes": row["limit_bytes"],
+                "used_bytes": row["used_bytes"],
+                "max_connections": row["max_connections"],
+                "created_at": row["created_at"],
+                "active": bool(row["active"]),
+                "expires_at": row["expires_at"],
+            }
+        # Load addresses
         CUSTOM_ADDRESSES.clear()
-        CUSTOM_ADDRESSES.extend(data.get("custom_addresses", ["www.speedtest.net"]))
-        CONFIG["telegram_token"] = data.get("telegram_token", "")
-        CONFIG["telegram_admin_id"] = data.get("telegram_admin_id", "")
-        CONFIG["bot_lang"] = data.get("bot_lang", "en") if data.get("bot_lang") in ("en", "fa") else "en"
+        cur = conn.execute("SELECT address FROM custom_addresses")
+        rows = cur.fetchall()
+        if rows:
+            CUSTOM_ADDRESSES.extend(row["address"] for row in rows)
+        else:
+            CUSTOM_ADDRESSES.append("www.speedtest.net")
+        # Load settings
+        cur = conn.execute("SELECT key, value FROM settings")
+        for row in cur.fetchall():
+            CONFIG[row["key"]] = row["value"]
     except Exception as e:
         logger.error(f"Error loading DB: {e}")
+    finally:
+        conn.close()
 
-# ── Auth ─────────────────────────────────────────────────────────────────────
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
 AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "admin"))}
-SESSIONS: dict = {}
-SESSIONS_LOCK = asyncio.Lock()
+
 
 async def create_session() -> str:
     token = secrets.token_urlsafe(32)
-    async with SESSIONS_LOCK:
-        SESSIONS[token] = time.time() + SESSION_TTL
+    conn = get_db()
+    try:
+        conn.execute("INSERT INTO sessions (token, expires_at) VALUES (?, ?)", (token, time.time() + SESSION_TTL))
+        conn.commit()
+    finally:
+        conn.close()
     return token
 
 async def is_valid_session(token: str | None) -> bool:
     if not token:
         return False
-    async with SESSIONS_LOCK:
-        exp = SESSIONS.get(token)
-        if exp is None or exp < time.time():
-            SESSIONS.pop(token, None)
+    conn = get_db()
+    try:
+        cur = conn.execute("SELECT expires_at FROM sessions WHERE token = ?", (token,))
+        row = cur.fetchone()
+        if row is None or row["expires_at"] < time.time():
+            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            conn.commit()
             return False
         return True
+    finally:
+        conn.close()
 
 async def destroy_session(token: str | None):
     if token:
-        async with SESSIONS_LOCK:
-            SESSIONS.pop(token, None)
+        conn = get_db()
+        try:
+            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            conn.commit()
+        finally:
+            conn.close()
+
+async def clear_expired_sessions():
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM sessions WHERE expires_at < ?", (time.time(),))
+        conn.commit()
+    finally:
+        conn.close()
 
 async def require_auth(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
@@ -348,26 +669,29 @@ async def require_auth(request: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
     return token
 
-# ── Keep-alive ────────────────────────────────────────────────────────────────
 async def keep_alive():
+    global http_client
     while True:
         await asyncio.sleep(600)
         try:
+            await clear_expired_sessions()
             domain = get_domain()
-            if domain and domain != "localhost":
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    await client.get(f"https://{domain}/health")
+            if domain and domain != "localhost" and http_client is not None:
+                await http_client.get(f"https://{domain}/health")
         except Exception:
             pass
 
 @app.on_event("startup")
 async def startup():
     global http_client
+    init_db()
     load_db()
+    migrate_legacy_uuids()
     limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
     timeout = httpx.Timeout(30.0, connect=10.0)
     http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
     asyncio.create_task(keep_alive())
+    asyncio.create_task(github_check_loop())
     await restart_telegram_bot()
     asyncio.create_task(telegram_notifier_cron())
     await ensure_default_link()
@@ -375,10 +699,10 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await _stop_telegram_bot()
+    await clear_expired_sessions()
     if http_client:
         await http_client.aclose()
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 def get_domain() -> str:
     return (
         os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"))
@@ -389,7 +713,7 @@ def generate_vless_link(uuid: str, remark: str = "Luffy", address: str = None, p
     domain = get_domain()
     addr = address if address else domain
     use_port = port if port else DEFAULT_PORT
-    path = f"/ws/{uuid}"
+    path = f"/ws/{uuid}?ed=2048"
     params = {
         "encryption": "none", "security": "tls", "type": "ws",
         "host": domain, "path": path, "sni": domain, "fp": "chrome", "alpn": "http/1.1"
@@ -431,7 +755,7 @@ def seconds_until_expiry(expires_at_str: str | None) -> int | None:
 async def ensure_default_link():
     async with LINKS_LOCK:
         if not LINKS:
-            LINKS["Default"] = {
+            LINKS[str(uuid.uuid4())] = {
                 "label": "Default",
                 "limit_bytes": 0,
                 "used_bytes": 0,
@@ -439,8 +763,47 @@ async def ensure_default_link():
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "active": True,
                 "expires_at": None,
-                "ports": [DEFAULT_PORT],
             }
+
+async def find_uid_by_label(label: str) -> str | None:
+    async with LINKS_LOCK:
+        for uid, data in LINKS.items():
+            if data["label"] == label:
+                return uid
+    return None
+
+_UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+
+def migrate_legacy_uuids():
+    """One-time migration: older versions of this panel used the link's label
+    as its VLESS uuid (e.g. 'Default', 'Ali'). Modern clients (Hiddify, Clash
+    Meta, and other sing-box/Xray-based apps) reject non-UUID ids outright.
+    This rewrites any such legacy link to use a real UUID, keeping its label,
+    quota, usage, and expiry intact."""
+    conn = get_db()
+    try:
+        changed = False
+        for old_uid, link in list(LINKS.items()):
+            if _UUID_RE.match(old_uid):
+                continue
+            new_uid = str(uuid.uuid4())
+            conn.execute("DELETE FROM links WHERE uuid = ?", (old_uid,))
+            conn.execute("""
+                INSERT OR REPLACE INTO links (uuid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (new_uid, link["label"], link["limit_bytes"], link["used_bytes"],
+                  link.get("max_connections", 0), link["created_at"],
+                  1 if link.get("active", True) else 0, link.get("expires_at")))
+            del LINKS[old_uid]
+            LINKS[new_uid] = link
+            changed = True
+            logger.info(f"Migrated legacy link '{link['label']}' to a standard UUID.")
+        if changed:
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error migrating legacy uuids: {e}")
+    finally:
+        conn.close()
 
 def get_client_ip(websocket: WebSocket) -> str:
     forwarded = websocket.headers.get("x-forwarded-for")
@@ -448,6 +811,14 @@ def get_client_ip(websocket: WebSocket) -> str:
         return forwarded.split(",")[0].strip()
     if websocket.client:
         return websocket.client.host
+    return "unknown"
+
+def get_request_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
     return "unknown"
 
 async def count_connections_for_link(uid: str) -> int:
@@ -477,7 +848,6 @@ async def close_connections_for_link(uid: str):
     async with connections_lock:
         link_ip_map.pop(uid, None)
 
-# ── Telegram Bot Engine ───────────────────────────────────────────────────────
 def _is_admin_chat(chat_id, admin_id) -> bool:
     if str(chat_id) != str(admin_id):
         logger.warning(
@@ -488,12 +858,6 @@ def _is_admin_chat(chat_id, admin_id) -> bool:
     return True
 
 async def _stop_telegram_bot():
-    """Stop any previously running bot/poller before starting a new one.
-    Without this, every restart (e.g. each time settings are saved) leaves
-    the old long-polling loop running, and Telegram only allows ONE active
-    getUpdates connection per bot token — the duplicate pollers fight each
-    other (409 Conflict) and commands like /start can silently stop being
-    delivered."""
     global bot, bot_polling_task
     if bot is not None:
         try:
@@ -543,12 +907,7 @@ async def restart_telegram_bot():
     async def cmd_start(message):
         if not _is_admin_chat(message.chat.id, admin_id):
             return
-        await bot.send_message(
-            message.chat.id,
-            L("welcome"),
-            parse_mode="HTML",
-            reply_markup=build_main_keyboard()
-        )
+        await bot.send_message(message.chat.id, L("welcome"), parse_mode="HTML", reply_markup=build_main_keyboard())
 
     @bot.message_handler(commands=['stats'])
     async def cmd_stats(message):
@@ -614,7 +973,7 @@ async def restart_telegram_bot():
 
         if call.data == "tg_lang_toggle":
             CONFIG["bot_lang"] = "fa" if bot_lang() == "en" else "en"
-            save_db()
+            await save_db()
             await bot.send_message(call.message.chat.id, L("lang_switched"), parse_mode="HTML", reply_markup=build_main_keyboard())
         elif call.data == "tg_stats":
             s_data = await get_internal_stats()
@@ -632,12 +991,6 @@ async def restart_telegram_bot():
 
     async def _run_polling(bot_instance):
         try:
-            # NOTE: skip_pending_updates is intentionally NOT passed here — the
-            # pyTelegramBotAPI version installed on this server forwards it into
-            # _process_polling(), which rejects it (TypeError), crashing polling
-            # every few seconds and preventing the bot from ever receiving
-            # updates. Pending updates are already cleared above via
-            # deleteWebhook?drop_pending_updates=true, so this isn't needed.
             await bot_instance.infinity_polling()
         except Exception as e:
             logger.error(f"Telegram Bot: polling loop stopped unexpectedly: {e}")
@@ -653,6 +1006,23 @@ async def send_tg_message(text: str):
             await bot.send_message(admin_id, text, parse_mode="HTML")
         except Exception as e:
             logger.error(f"Error sending TG notification: {e}")
+
+def _notify_connections_enabled() -> bool:
+    return str(CONFIG.get("notify_connections", "0")) in ("1", "true", "True")
+
+async def _log_connection_event(event: str, label: str, uid: str, ip: str, extra: str = ""):
+    """Logs every client connect/disconnect and, if enabled in Settings,
+    forwards the same event to the admin via Telegram."""
+    verb = "Connected" if event == "connect" else "Disconnected"
+    suffix = f" - {extra}" if extra else ""
+    logger.info(f"{verb}: link='{label}' ({uid}) from {ip}{suffix}")
+    if _notify_connections_enabled():
+        icon = "🟢" if event == "connect" else "🔴"
+        verb_fa = "متصل شد" if event == "connect" else "قطع اتصال شد"
+        msg = f"{icon} <b>{html.escape(label)}</b> {verb_fa}\nIP: <code>{html.escape(ip)}</code>"
+        if extra:
+            msg += f"\n{html.escape(extra)}"
+        await send_tg_message(msg)
 
 def fmt_exp_py(ea: str | None) -> str:
     if not ea:
@@ -691,10 +1061,10 @@ async def get_internal_stats():
 def make_stats_text(s_data) -> str:
     return L(
         "stats",
-        domain=s_data.get("domain", "–"),
+        domain=s_data.get("domain", "-"),
         cpu=s_data.get("cpu_percent", 0),
         mem=s_data.get("memory_percent", 0),
-        uptime=s_data.get("uptime", "–"),
+        uptime=s_data.get("uptime", "-"),
         active=s_data.get("active_connections", 0),
         traffic=s_data.get("total_traffic_mb", 0),
         links=s_data.get("links_count", 0),
@@ -755,7 +1125,7 @@ async def handle_create_command(text: str):
             return L("create_bad_days")
 
     async with LINKS_LOCK:
-        if label in LINKS:
+        if any(v["label"] == label for v in LINKS.values()):
             return L("create_exists", label=label)
 
     limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, "GB")
@@ -763,7 +1133,7 @@ async def handle_create_command(text: str):
     if days_valid > 0:
         expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
 
-    uid = label
+    uid = str(uuid.uuid4())
     async with LINKS_LOCK:
         LINKS[uid] = {
             "label": label,
@@ -775,7 +1145,7 @@ async def handle_create_command(text: str):
             "expires_at": expires_at,
         }
 
-    save_db()
+    await save_db()
     vless_link = generate_vless_link(uid, remark=f"Luffy-{label}", port=DEFAULT_PORT)
     sub_url = f"https://{get_domain()}/sub/{uid}"
 
@@ -799,7 +1169,7 @@ async def handle_addaddr_command(text: str) -> str:
         if addr in CUSTOM_ADDRESSES:
             return L("addaddr_exists", addr=addr)
         CUSTOM_ADDRESSES.append(addr)
-    save_db()
+    await save_db()
     return L("addaddr_success", addr=addr)
 
 async def handle_toggle_command(text: str, active_state: bool) -> str:
@@ -808,11 +1178,12 @@ async def handle_toggle_command(text: str, active_state: bool) -> str:
         action_name = "enable" if active_state else "disable"
         return L("toggle_format", action=action_name)
     name = parts[1].strip()
+    uid = await find_uid_by_label(name)
+    if uid is None:
+        return L("not_found", name=name)
     async with LINKS_LOCK:
-        if name not in LINKS:
-            return L("toggle_not_found", name=name)
-        LINKS[name]["active"] = active_state
-    save_db()
+        LINKS[uid]["active"] = active_state
+    await save_db()
     state_str = L("state_enabled") if active_state else L("state_disabled")
     return L("toggle_success", name=name, state=state_str)
 
@@ -821,11 +1192,13 @@ async def handle_reset_command(text: str) -> str:
     if len(parts) < 2:
         return L("reset_format")
     name = parts[1].strip()
+    uid = await find_uid_by_label(name)
+    if uid is None:
+        return L("not_found", name=name)
     async with LINKS_LOCK:
-        if name not in LINKS:
-            return L("toggle_not_found", name=name)
-        LINKS[name]["used_bytes"] = 0
-    save_db()
+        LINKS[uid]["used_bytes"] = 0
+    notified_uids.discard(f"quota_{name}")
+    await save_db()
     return L("reset_success", name=name)
 
 async def telegram_notifier_cron():
@@ -844,7 +1217,6 @@ async def telegram_notifier_cron():
                 if not data["active"]:
                     continue
                 
-                # Check Quota
                 used = data["used_bytes"]
                 limit = data["limit_bytes"]
                 label = data["label"]
@@ -855,8 +1227,12 @@ async def telegram_notifier_cron():
                         msg = L("quota_alert", label=label, used=_fmt_bytes(used), limit=_fmt_bytes(limit))
                         await send_tg_message(msg)
                         notified_uids.add(notif_key)
+                        await create_notification(
+                            type="quota",
+                            title=f"Quota exceeded: {label}",
+                            message=f"{label} used {_fmt_bytes(used)} of {_fmt_bytes(limit)}",
+                        )
                 
-                # Check Expiry
                 expires_at_str = data.get("expires_at")
                 if expires_at_str:
                     exp = parse_expires_at(expires_at_str)
@@ -866,19 +1242,19 @@ async def telegram_notifier_cron():
                             msg = L("expiry_alert", label=label, exp=expires_at_str)
                             await send_tg_message(msg)
                             notified_uids.add(notif_key)
+                            await create_notification(
+                                type="expiry",
+                                title=f"Expired: {label}",
+                                message=f"{label} has expired on {expires_at_str}",
+                            )
                             
         except Exception as e:
             logger.error(f"Error in notification cron: {e}")
             
         await asyncio.sleep(60)
 
-# ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    # NOTE: this used to return {"service": "Luffy Panel", ...} — a plaintext
-    # admission that this server is a proxy panel, visible to anyone who simply
-    # curls the domain. Active-probing/DPI systems check exactly this kind of
-    # thing. Return something generic instead.
     return Response(content="OK", media_type="text/plain")
 
 @app.get("/health")
@@ -887,15 +1263,38 @@ async def health():
         conn_count = len(connections)
     return {"status": "ok", "connections": conn_count, "uptime": uptime()}
 
+@app.get("/api/ping-check")
+async def ping_check(host: str, port: int = 443):
+    """Measures real TCP connect latency to a config's host from the panel's
+    own server/network (not the visitor's browser), so results reflect the
+    server's actual reachability instead of being limited by browser CORS."""
+    if port < 1 or port > 65535:
+        return {"host": host, "port": port, "ms": None, "reachable": False}
+    start = time.time()
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=5.0)
+        ms = round((time.time() - start) * 1000)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return {"host": host, "port": port, "ms": ms, "reachable": True}
+    except Exception:
+        return {"host": host, "port": port, "ms": None, "reachable": False}
+
 @app.post("/api/login")
 async def api_login(request: Request):
     body = await request.json()
     password = str(body.get("password") or "")
+    ip = get_request_ip(request)
     if hash_password(password) != AUTH["password_hash"]:
+        await send_tg_message(f"⚠️ <b>تلاش ناموفق برای ورود به پنل</b>\nIP: <code>{html.escape(ip)}</code>")
         raise HTTPException(status_code=401, detail="Invalid password")
     token = await create_session()
     resp = JSONResponse({"ok": True})
     resp.set_cookie(key=SESSION_COOKIE, value=token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
+    await send_tg_message(f"🟢 <b>ورود ادمین به پنل</b>\nIP: <code>{html.escape(ip)}</code>")
     return resp
 
 @app.post("/api/logout")
@@ -904,12 +1303,26 @@ async def api_logout(request: Request):
     await destroy_session(token)
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(SESSION_COOKIE, path="/")
+    await send_tg_message(f"🔴 <b>خروج ادمین از پنل</b>\nIP: <code>{html.escape(get_request_ip(request))}</code>")
     return resp
 
 @app.get("/api/me")
 async def api_me(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
     return {"authenticated": await is_valid_session(token)}
+
+@app.get("/api/version")
+async def api_version():
+    gh = await check_github_latest()
+    latest = gh.get("tag")
+    current = PANEL_VERSION.lstrip("vV")
+    update_available = bool(latest) and latest.lstrip("vV") != current
+    return {
+        "version": PANEL_VERSION,
+        "latest_github_version": latest,
+        "update_available": update_available,
+        "github_url": gh.get("url") or f"https://github.com/{GITHUB_REPO}/releases",
+    }
 
 @app.post("/api/change-password")
 async def api_change_password(request: Request, _=Depends(require_auth)):
@@ -921,29 +1334,225 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
     if len(new) < 4:
         raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
     AUTH["password_hash"] = hash_password(new)
-    save_db()
+    await save_db()
     current_token = request.cookies.get(SESSION_COOKIE)
-    async with SESSIONS_LOCK:
-        SESSIONS.clear()
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM sessions")
         if current_token:
-            SESSIONS[current_token] = time.time() + SESSION_TTL
+            conn.execute("INSERT INTO sessions (token, expires_at) VALUES (?, ?)", (current_token, time.time() + SESSION_TTL))
+        conn.commit()
+    finally:
+        conn.close()
     return {"ok": True}
 
 @app.get("/api/settings")
 async def get_settings(_=Depends(require_auth)):
     return {
         "telegram_token": CONFIG["telegram_token"],
-        "telegram_admin_id": CONFIG["telegram_admin_id"]
+        "telegram_admin_id": CONFIG["telegram_admin_id"],
+        "railway_token": CONFIG.get("railway_token", ""),
+        "notify_connections": CONFIG.get("notify_connections", "0") in ("1", "true", "True", True),
     }
 
 @app.post("/api/settings")
 async def update_settings(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    CONFIG["telegram_token"] = body.get("telegram_token", "").strip()
-    CONFIG["telegram_admin_id"] = body.get("telegram_admin_id", "").strip()
-    save_db()
+    # Only touch fields the caller actually sent, so saving from one settings
+    # form (e.g. just the Telegram fields) doesn't wipe out fields that
+    # belong to another form (e.g. the Railway token).
+    if "telegram_token" in body:
+        CONFIG["telegram_token"] = (body.get("telegram_token") or "").strip()
+    if "telegram_admin_id" in body:
+        CONFIG["telegram_admin_id"] = (body.get("telegram_admin_id") or "").strip()
+    if "railway_token" in body:
+        CONFIG["railway_token"] = (body.get("railway_token") or "").strip()
+    if "notify_connections" in body:
+        CONFIG["notify_connections"] = "1" if body.get("notify_connections") else "0"
+    await save_db()
     await restart_telegram_bot()
     return {"ok": True}
+
+# ── Railway / Permanent Database ──────────────────────────────────────────
+
+RAILWAY_API_URL = "https://backboard.railway.com/graphql/v2"
+
+async def _railway_graphql(token: str, query: str, variables: dict = None) -> dict:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    body = {"query": query}
+    if variables:
+        body["variables"] = variables
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(RAILWAY_API_URL, json=body, headers=headers)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Railway API error: {r.status_code}")
+        data = r.json()
+        if "errors" in data:
+            raise HTTPException(status_code=502, detail=data["errors"][0].get("message", "Railway API error"))
+        return data.get("data", {})
+
+@app.post("/api/railway/projects")
+async def railway_list_projects(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    token = body.get("token", "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Railway token is required")
+
+    projects = []
+    seen_ids = set()
+
+    # Personal-account-scoped projects (not inside any workspace)
+    personal_data = await _railway_graphql(token, """
+        query {
+            projects {
+                edges { node { id name } }
+            }
+        }
+    """)
+    for edge in personal_data.get("projects", {}).get("edges", []):
+        node = edge.get("node", {})
+        if node.get("id") and node["id"] not in seen_ids:
+            seen_ids.add(node["id"])
+            projects.append({"id": node["id"], "name": node.get("name", "Unnamed")})
+
+    # Most Railway accounts now keep their projects inside a workspace, so we
+    # also need to enumerate workspaces and fetch each one's projects.
+    try:
+        ws_data = await _railway_graphql(token, """
+            query {
+                me { workspaces { id name } }
+            }
+        """)
+        workspaces = (ws_data.get("me") or {}).get("workspaces") or []
+    except HTTPException:
+        # A workspace- or project-scoped token can't call `me`; that's fine,
+        # we just skip workspace enumeration and keep whatever we already have.
+        workspaces = []
+
+    for ws in workspaces:
+        ws_id = ws.get("id")
+        if not ws_id:
+            continue
+        try:
+            ws_projects = await _railway_graphql(token, """
+                query ($workspaceId: String!) {
+                    projects(workspaceId: $workspaceId) {
+                        edges { node { id name } }
+                    }
+                }
+            """, {"workspaceId": ws_id})
+        except HTTPException:
+            continue
+        for edge in ws_projects.get("projects", {}).get("edges", []):
+            node = edge.get("node", {})
+            if node.get("id") and node["id"] not in seen_ids:
+                seen_ids.add(node["id"])
+                projects.append({"id": node["id"], "name": node.get("name", "Unnamed")})
+
+    return {"projects": projects}
+
+async def _railway_resolve_service(token: str, project_id: str) -> dict:
+    """Figures out which service in the project the volume should attach to.
+
+    Railway limits each service to a single volume, and there's no reliable
+    way to guess which of a project's services is "the panel" without extra
+    input from the user - except that when this app is itself deployed on
+    Railway, Railway automatically injects RAILWAY_SERVICE_ID into its own
+    environment. We use that for a fully automatic match, and fall back to
+    "only one service in the project" when it's not available or doesn't
+    belong to this project.
+    """
+    data = await _railway_graphql(token, """
+        query ($id: String!) {
+            project(id: $id) {
+                services { edges { node { id name } } }
+            }
+        }
+    """, {"id": project_id})
+    services = [e["node"] for e in ((data.get("project") or {}).get("services") or {}).get("edges", [])]
+    if not services:
+        raise HTTPException(status_code=400, detail="No services found in this project.")
+    own_service_id = os.environ.get("RAILWAY_SERVICE_ID", "").strip()
+    if own_service_id:
+        match = next((s for s in services if s["id"] == own_service_id), None)
+        if match:
+            return match
+    if len(services) == 1:
+        return services[0]
+    raise HTTPException(
+        status_code=400,
+        detail="Multiple services found in this project and the panel's own service couldn't be identified automatically. Make sure you're running this panel as a Railway service inside the selected project.",
+    )
+
+@app.post("/api/railway/volume-status")
+async def railway_volume_status(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    token = body.get("token", "").strip()
+    project_id = body.get("project_id", "").strip()
+    if not token or not project_id:
+        raise HTTPException(status_code=400, detail="Token and project_id are required")
+    service = await _railway_resolve_service(token, project_id)
+    data = await _railway_graphql(token, """
+        query ($id: String!) {
+            project(id: $id) {
+                volumes {
+                    edges {
+                        node {
+                            id
+                            name
+                            volumeInstances {
+                                edges { node { id mountPath state serviceId environmentId } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    """, {"id": project_id})
+    volumes = []
+    for edge in ((data.get("project") or {}).get("volumes") or {}).get("edges", []):
+        node = edge["node"]
+        for vi_edge in (node.get("volumeInstances") or {}).get("edges", []):
+            vi = vi_edge["node"]
+            if vi.get("serviceId") == service["id"]:
+                volumes.append({
+                    "id": node["id"],
+                    "name": node.get("name", ""),
+                    "path": vi.get("mountPath", ""),
+                    "state": vi.get("state", ""),
+                })
+    has_data_volume = any(v["path"] in ("data", "/data") for v in volumes) or bool(volumes)
+    return {"volumes": volumes, "has_data_volume": has_data_volume, "service_name": service.get("name", "")}
+
+@app.post("/api/railway/create-volume")
+async def railway_create_volume(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    token = body.get("token", "").strip()
+    project_id = body.get("project_id", "").strip()
+    if not token or not project_id:
+        raise HTTPException(status_code=400, detail="Token and project_id are required")
+    service = await _railway_resolve_service(token, project_id)
+    volume_input = {"projectId": project_id, "serviceId": service["id"], "mountPath": "/data"}
+    env_id = os.environ.get("RAILWAY_ENVIRONMENT_ID", "").strip()
+    if env_id:
+        volume_input["environmentId"] = env_id
+    data = await _railway_graphql(token, """
+        mutation ($input: VolumeCreateInput!) {
+            volumeCreate(input: $input) { id name }
+        }
+    """, {"input": volume_input})
+    vol = data.get("volumeCreate") or {}
+    if not vol.get("id"):
+        raise HTTPException(status_code=502, detail="Failed to create volume")
+    return {
+        "id": vol["id"],
+        "name": vol.get("name", ""),
+        "path": "/data",
+        "state": "creating",
+    }
 
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
@@ -973,7 +1582,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
     if not label:
         raise HTTPException(status_code=400, detail="Inbound name is required")
     async with LINKS_LOCK:
-        if label in LINKS:
+        if any(v["label"] == label for v in LINKS.values()):
             raise HTTPException(status_code=400, detail="An inbound with this name already exists")
     limit_value = float(body.get("limit_value") or 0)
     limit_unit = body.get("limit_unit") or "GB"
@@ -990,7 +1599,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
                 expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
         except (ValueError, TypeError):
             pass
-    uid = label
+    uid = str(uuid.uuid4())
     async with LINKS_LOCK:
         LINKS[uid] = {
             "label": label,
@@ -1001,7 +1610,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
             "active": True,
             "expires_at": expires_at,
         }
-    save_db()
+    await save_db()
     return {
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": LINKS[uid]["created_at"],
@@ -1042,8 +1651,10 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             limit_value = float(body.get("limit_value") or 0)
             limit_unit = body.get("limit_unit") or "GB"
             LINKS[uid]["limit_bytes"] = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+            notified_uids.discard(f"quota_{uid}")
         if "reset_usage" in body and body["reset_usage"]:
             LINKS[uid]["used_bytes"] = 0
+            notified_uids.discard(f"quota_{uid}")
         if "label" in body:
             LINKS[uid]["label"] = str(body["label"])[:60]
         if "max_connections" in body:
@@ -1056,16 +1667,17 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
                     LINKS[uid]["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=dv)).isoformat()
                 else:
                     LINKS[uid]["expires_at"] = None
+                notified_uids.discard(f"expiry_{uid}")
             except (ValueError, TypeError):
                 pass
-    save_db()
+    await save_db()
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
         LINKS.pop(uid, None)
-    save_db()
+    await save_db()
     await close_connections_for_link(uid)
     return {"ok": True}
 
@@ -1086,14 +1698,14 @@ async def add_address(request: Request, _=Depends(require_auth)):
         if address in CUSTOM_ADDRESSES:
             raise HTTPException(status_code=400, detail="Address already exists")
         CUSTOM_ADDRESSES.append(address)
-    save_db()
+    await save_db()
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
 @app.delete("/api/addresses")
 async def delete_all_addresses(_=Depends(require_auth)):
     async with CUSTOM_ADDRESSES_LOCK:
         CUSTOM_ADDRESSES.clear()
-    save_db()
+    await save_db()
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
 @app.delete("/api/addresses/{index}")
@@ -1103,10 +1715,49 @@ async def delete_address(index: int, _=Depends(require_auth)):
             CUSTOM_ADDRESSES.pop(index)
         else:
             raise HTTPException(status_code=404, detail="Address not found")
-    save_db()
+    await save_db()
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
-# ── Live Logs WebSocket ───────────────────────────────────────────────────────
+# ── Notifications API ────────────────────────────────────────────────────
+
+@app.get("/api/notifications")
+async def api_get_notifications(_=Depends(require_auth)):
+    return {"notifications": await get_notifications()}
+
+@app.get("/api/notifications/count")
+async def api_notification_count(_=Depends(require_auth)):
+    return {"count": await get_unread_notification_count()}
+
+@app.post("/api/notifications/{nid}/seen")
+async def api_mark_seen(nid: int, _=Depends(require_auth)):
+    conn = get_db()
+    try:
+        conn.execute("UPDATE notifications SET seen = 1 WHERE id = ?", (nid,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
+
+@app.post("/api/notifications/seen-all")
+async def api_mark_all_seen(_=Depends(require_auth)):
+    conn = get_db()
+    try:
+        conn.execute("UPDATE notifications SET seen = 1 WHERE seen = 0")
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
+
+@app.delete("/api/notifications")
+async def api_clear_notifications(_=Depends(require_auth)):
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM notifications")
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
+
 @app.websocket("/ws/live-logs")
 async def ws_live_logs(websocket: WebSocket, token: str | None = None):
     await websocket.accept()
@@ -1131,7 +1782,6 @@ async def ws_live_logs(websocket: WebSocket, token: str | None = None):
     except Exception:
         pass
 
-# ── Landing Page Generator ────────────────────────────────────────────────────
 def _fmt_bytes(b: int) -> str:
     if b >= 1_073_741_824: return f"{b / 1_073_741_824:.1f}GB"
     if b >= 1_048_576: return f"{b / 1_048_576:.1f}MB"
@@ -1141,7 +1791,7 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
     used = link["used_bytes"]
     limit = link["limit_bytes"]
     expires_at_str = link.get("expires_at")
-    
+
     usage_str = f"{_fmt_bytes(used)} / Unlimited" if limit == 0 else f"{_fmt_bytes(used)} / {_fmt_bytes(limit)}"
     pct = round((used / limit) * 100, 1) if limit > 0 else 0
     rem = limit - used if limit > 0 else -1
@@ -1150,236 +1800,642 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
     secs_left = seconds_until_expiry(expires_at_str)
     if secs_left is None:
         expiry_str = "Unlimited"
+        expiry_days = None
     elif secs_left == 0:
         expiry_str = "Expired"
+        expiry_days = 0
     else:
         days = secs_left // 86400
         hours = (secs_left % 86400) // 3600
-        expiry_str = f"{days} Days, {hours} Hours Left"
+        expiry_str = f"{days}d {hours}h"
+        expiry_days = days
+
+    # Parse expiry date string for display
+    expiry_date_str = ""
+    if expires_at_str:
+        exp_dt = parse_expires_at(expires_at_str)
+        if exp_dt:
+            expiry_date_str = exp_dt.strftime("%d %b %Y").upper()
 
     configs = [generate_vless_link(uid, remark=f"Luffy-{link['label']}", port=DEFAULT_PORT)]
     for i, addr in enumerate(addresses):
         configs.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}-IP{i+1}", address=addr, port=DEFAULT_PORT))
 
+    # Sub URL for QR
+    sub_url = f"https://{get_domain()}/sub/{uid}"
     configs_json = json.dumps(configs)
+
+    is_active = link["active"]
+    status_text = "Active" if is_active else "Inactive"
     
+    # Color based on usage percentage
+    if pct >= 90:
+        ring_color1 = "#f87171"
+        ring_color2 = "#ef4444"
+    elif pct >= 70:
+        ring_color1 = "#fbbf24"
+        ring_color2 = "#f59e0b"
+    else:
+        ring_color1 = "#FFD700"
+        ring_color2 = "#FFC200"
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Luffy Connection Status</title>
-    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@400;600;700&display=swap" rel="stylesheet">
+    <title>Luffy - {link['label']}</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
     <style>
-        * {{ margin:0; padding:0; box-sizing:border-box; }}
-        body {{
-            background: #060608;
-            font-family: 'Inter', 'Vazirmatn', sans-serif;
-            color: rgba(255,255,255,0.92);
-            padding: 20px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
+        *{{margin:0;padding:0;box-sizing:border-box}}
+        :root{{
+            --gold:#FFD700;--gold2:#FFC200;--gold3:#C8900A;
+            --gold-dim:rgba(255,215,0,0.1);--gold-glow:0 0 20px rgba(255,215,0,0.3);
+            --bg:#040810;--bg2:#080f1a;--bg3:#0d1626;
+            --surface:rgba(8,15,26,0.95);--surface2:rgba(13,22,38,0.9);
+            --border:rgba(255,215,0,0.12);--border2:rgba(255,215,0,0.25);
+            --text:rgba(255,255,255,0.92);--text2:rgba(255,215,0,0.7);--text3:rgba(255,255,255,0.4);
+            --green:#4ade80;--red:#f87171;--yellow:#fbbf24;
         }}
-        .container {{
-            width: 100%;
-            max-width: 500px;
-            background: rgba(12,12,18,0.97);
-            border: 1px solid rgba(255,215,0,0.15);
-            border-radius: 20px;
-            padding: 24px;
-            box-shadow: 0 0 24px rgba(255,215,0,0.1);
+        html,body{{height:100%;background:var(--bg);font-family:'Inter',sans-serif;color:var(--text)}}
+        body{{padding:0;display:flex;flex-direction:column;align-items:center;min-height:100vh;overflow-x:hidden}}
+
+        /* Animated background */
+        .bg-glow{{position:fixed;inset:0;z-index:0;pointer-events:none;
+            background:radial-gradient(ellipse 60% 40% at 50% -5%,rgba(255,215,0,0.08),transparent 60%),
+                       radial-gradient(ellipse 40% 30% at 80% 80%,rgba(255,215,0,0.05),transparent 50%);}}
+        .grid-bg{{position:fixed;inset:0;z-index:0;pointer-events:none;
+            background-image:linear-gradient(rgba(255,215,0,0.03) 1px,transparent 1px),
+                             linear-gradient(90deg,rgba(255,215,0,0.03) 1px,transparent 1px);
+            background-size:48px 48px;}}
+        /* Shooting stars */
+        .shooting-stars{{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}}
+        .shooting-stars .star{{position:absolute;width:110px;height:1px;
+            background:linear-gradient(90deg,transparent,rgba(255,215,0,0.55));
+            filter:drop-shadow(0 0 4px rgba(255,215,0,0.35));
+            opacity:0;transform:translate3d(0,0,0) rotate(18deg);
+            animation:shoot 7s linear infinite}}
+        .shooting-stars .star::after{{content:"";position:absolute;right:0;top:-1px;
+            width:3px;height:3px;border-radius:50%;background:var(--gold);
+            box-shadow:0 0 6px 1px rgba(255,215,0,0.7)}}
+        .shooting-stars .star:nth-child(1){{top:8%;left:66%;animation-delay:0s}}
+        .shooting-stars .star:nth-child(2){{top:24%;left:84%;animation-delay:2.6s;animation-duration:8s}}
+        .shooting-stars .star:nth-child(3){{top:42%;left:58%;animation-delay:5.2s;animation-duration:6.5s}}
+        .shooting-stars .star:nth-child(4){{top:16%;left:38%;animation-delay:3.8s;animation-duration:7.5s}}
+        .shooting-stars .star:nth-child(5){{top:58%;left:88%;animation-delay:6.4s;animation-duration:9s}}
+        @keyframes shoot{{
+            0%{{opacity:0;transform:translate3d(0,0,0) rotate(18deg)}}
+            6%{{opacity:0.75}}
+            16%{{opacity:0}}
+            100%{{opacity:0;transform:translate3d(-360px,118px,0) rotate(18deg)}}
         }}
-        .brand {{
-            text-align: center;
-            margin-bottom: 20px;
+        @media (prefers-reduced-motion: reduce){{
+            .shooting-stars{{display:none}}
         }}
-        .brand h1 {{
-            font-family: 'Cinzel', serif;
-            font-size: 22px;
-            color: #FFD700;
-            letter-spacing: 2px;
+        /* Starfield */
+        .starfield{{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}}
+        .starfield .s{{position:absolute;border-radius:50%;background:#fff;
+            animation-name:twinkle;animation-timing-function:ease-in-out;animation-iteration-count:infinite}}
+        @keyframes twinkle{{0%,100%{{opacity:.12}}50%{{opacity:.9}}}}
+        @media (prefers-reduced-motion: reduce){{
+            .starfield .s{{animation:none;opacity:.4}}
         }}
-        .card {{
-            background: rgba(20,20,28,0.9);
-            border: 1px solid rgba(255,215,0,0.08);
-            border-radius: 14px;
-            padding: 16px;
-            margin-bottom: 14px;
-        }}
-        .user-header {{
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 12px;
-        }}
-        .username {{
-            font-size: 18px;
-            font-weight: 700;
-            color: #fff;
-        }}
-        .status-badge {{
-            padding: 3px 8px;
-            border-radius: 6px;
-            font-size: 10px;
-            font-weight: 800;
-            text-transform: uppercase;
-        }}
-        .status-active {{ background: rgba(74,222,128,0.15); color: #4ade80; border: 1px solid rgba(74,222,128,0.3); }}
-        .status-expired {{ background: rgba(248,113,113,0.15); color: #f87171; border: 1px solid rgba(248,113,113,0.3); }}
-        .label {{ font-size: 11px; color: rgba(255,255,255,0.4); text-transform: uppercase; letter-spacing: 1px; }}
-        .val {{ font-size: 16px; font-weight: 600; color: #fff; margin-top: 2px; }}
-        .progress-bar {{
-            height: 6px;
-            background: rgba(255,255,255,0.05);
-            border-radius: 3px;
-            overflow: hidden;
-            margin: 12px 0;
-        }}
-        .progress-fill {{
-            height: 100%;
-            background: linear-gradient(90deg, #FFD700, #C8900A);
-            transition: width 0.5s;
-        }}
-        .config-list {{
-            margin-top: 15px;
-        }}
-        .config-item {{
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            background: rgba(28,28,40,0.8);
-            border: 1px solid rgba(255,255,255,0.05);
-            padding: 10px 12px;
-            border-radius: 8px;
-            margin-bottom: 8px;
-            font-size: 12.5px;
-        }}
-        .config-name {{
-            font-weight: 600;
-            color: rgba(255,255,255,0.8);
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-            max-width: 60%;
-        }}
-        .btn {{
-            font-family: inherit;
-            font-size: 11.5px;
-            font-weight: 700;
-            border-radius: 6px;
-            padding: 5px 10px;
-            cursor: pointer;
-            border: none;
-            transition: all 0.2s;
-        }}
-        .btn-gold {{ background: #FFD700; color: #000; }}
-        .btn-gold:hover {{ filter: brightness(1.1); }}
-        .btn-ghost {{ background: rgba(255,255,255,0.05); color: #fff; border: 1px solid rgba(255,255,255,0.1); }}
-        .btn-ghost:hover {{ background: rgba(255,255,255,0.1); }}
-        .mo {{
-            position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 200; display: none; align-items: center; justify-content: center; backdrop-filter: blur(8px);
-        }}
-        .mo.show {{ display: flex; }}
-        .mo-box {{
-            background: rgba(20,20,28,0.95); border: 1px solid rgba(255,215,0,0.2); border-radius: 18px; padding: 24px; width: 90%; max-width: 320px; text-align: center; position: relative;
-        }}
-        .mo-box img {{ max-width: 100%; border-radius: 8px; border: 3px solid rgba(255,215,0,0.15); margin-top: 15px; }}
-        .mo-close {{ position: absolute; top: 12px; right: 12px; font-size: 16px; cursor: pointer; color: rgba(255,255,255,0.4); background: none; border: none; }}
-        .toast {{
-            position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(16px); background: #0c0c10; color: #FFD700; border: 1px solid rgba(255,215,0,0.2); border-radius: 10px; padding: 10px 18px; font-size: 13px; font-weight: 600; opacity: 0; transition: all 0.3s; z-index: 999;
-        }}
-        .toast.show {{ opacity: 1; transform: translateX(-50%) translateY(0); }}
+
+
+        .container{{width:100%;max-width:420px;padding:20px 16px 40px;position:relative;z-index:1}}
+
+        /* Header */
+        .header{{text-align:center;padding:24px 0 20px}}
+        .header-logo{{display:inline-flex;align-items:center;gap:10px;margin-bottom:8px}}
+        .header-title{{font-size:22px;font-weight:900;letter-spacing:3px;
+            background:linear-gradient(135deg,#fff,var(--gold));
+            -webkit-background-clip:text;-webkit-text-fill-color:transparent}}
+        .header-sub{{font-size:11px;color:var(--text3);letter-spacing:2px;text-transform:uppercase}}
+
+        /* Usage ring card */
+        .ring-card{{background:var(--surface2);border:1px solid var(--border);border-radius:20px;
+            padding:28px 24px;margin-bottom:14px;text-align:center;
+            box-shadow:0 4px 24px rgba(0,0,0,0.4),inset 0 1px 0 rgba(255,215,0,0.08)}}
+        .ring-wrap{{position:relative;width:160px;height:160px;margin:0 auto 20px}}
+        .ring-svg{{width:160px;height:160px;transform:rotate(-90deg)}}
+        .ring-bg{{fill:none;stroke:rgba(255,215,0,0.08);stroke-width:10}}
+        .ring-fill{{fill:none;stroke-width:10;stroke-linecap:round;
+            stroke-dasharray:440;stroke-dashoffset:{440 - (440 * min(pct,100)/100):.1f};
+            stroke:url(#ringGrad);filter:drop-shadow(0 0 8px {ring_color1});
+            transition:stroke-dashoffset 1s ease}}
+        .ring-center{{position:absolute;inset:0;display:flex;flex-direction:column;
+            align-items:center;justify-content:center}}
+        .ring-pct{{font-size:32px;font-weight:900;color:#fff;letter-spacing:-1px}}
+        .ring-label{{font-size:9px;font-weight:700;color:var(--text3);letter-spacing:2px;text-transform:uppercase;margin-top:2px}}
+
+        .usage-nums{{font-size:20px;font-weight:700;margin-bottom:4px}}
+        .usage-nums span{{color:var(--text3);font-size:14px;font-weight:400}}
+        .usage-sub{{font-size:11px;color:var(--text3)}}
+
+        .info-row{{display:flex;gap:12px;margin-top:18px}}
+        .info-box{{flex:1;background:rgba(255,215,0,0.05);border:1px solid rgba(255,215,0,0.1);
+            border-radius:10px;padding:10px 12px;text-align:left}}
+        .info-box-label{{font-size:9px;font-weight:700;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px}}
+        .info-box-val{{font-size:13px;font-weight:700}}
+        .info-box-val.green{{color:var(--green)}}
+        .info-box-val.red{{color:var(--red)}}
+        .info-box-val.gold{{color:var(--gold)}}
+        .info-box-sub{{font-size:10px;color:var(--text3);margin-top:1px}}
+
+        /* QR card */
+        .qr-card{{background:var(--surface2);border:1px solid var(--border);border-radius:20px;
+            padding:24px;margin-bottom:14px;text-align:center;
+            box-shadow:0 4px 24px rgba(0,0,0,0.4)}}
+        .qr-wrap{{background:#fff;border-radius:12px;padding:12px;display:inline-block;
+            box-shadow:0 0 24px rgba(255,215,0,0.2);margin-bottom:14px}}
+        .qr-wrap img{{width:180px;height:180px;display:block;border-radius:4px}}
+        .qr-label{{font-size:9px;letter-spacing:2px;color:var(--text3);text-transform:uppercase;margin-bottom:4px}}
+        .sub-link-display{{font-size:11px;color:var(--gold);font-weight:600;
+            background:var(--gold-dim);border:1px solid var(--border);border-radius:8px;
+            padding:8px 12px;word-break:break-all;cursor:pointer;transition:all .2s}}
+        .sub-link-display:hover{{background:rgba(255,215,0,0.15);border-color:var(--border2)}}
+        .copy-sub-btn{{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;
+            padding:12px;border-radius:10px;margin-top:10px;cursor:pointer;border:none;font-family:inherit;
+            font-size:14px;font-weight:700;
+            background:linear-gradient(135deg,var(--gold),var(--gold2));color:#000;
+            box-shadow:0 0 20px rgba(255,215,0,0.25);transition:all .2s}}
+        .copy-sub-btn:hover{{filter:brightness(1.1);box-shadow:0 0 30px rgba(255,215,0,0.4)}}
+
+        /* Platform chips */
+        .section-label{{font-size:9px;font-weight:800;letter-spacing:2px;color:var(--text3);
+            text-transform:uppercase;margin:20px 0 10px}}
+        .platform-chips{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}}
+        .chip{{padding:7px 14px;border-radius:20px;border:1px solid var(--border);
+            background:var(--surface2);color:var(--text3);font-size:11px;font-weight:600;
+            cursor:pointer;transition:all .2s;display:flex;align-items:center;gap:5px}}
+        .chip:hover,.chip.active{{background:var(--gold-dim);border-color:var(--border2);color:var(--gold)}}
+
+        /* App cards */
+        .apps-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}}
+        .app-card{{background:var(--surface2);border:1px solid var(--border);border-radius:14px;
+            padding:14px;cursor:pointer;transition:all .2s;text-decoration:none;display:block}}
+        .app-card:hover{{border-color:var(--border2);background:rgba(13,22,38,0.98);
+            box-shadow:0 0 16px rgba(255,215,0,0.1);transform:translateY(-2px)}}
+        .app-icon{{width:36px;height:36px;border-radius:8px;margin-bottom:8px;
+            display:flex;align-items:center;justify-content:center;font-size:20px}}
+        .app-name{{font-size:13px;font-weight:700;color:var(--text);margin-bottom:2px}}
+        .app-action{{font-size:10.5px;color:var(--text3)}}
+
+        /* Config list */
+        .configs-card{{background:var(--surface2);border:1px solid var(--border);border-radius:20px;
+            padding:18px;margin-bottom:14px}}
+        .configs-header{{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}}
+        .configs-title{{font-size:12px;font-weight:700;color:var(--text);letter-spacing:.5px}}
+        .configs-count{{font-size:10px;color:var(--text3);background:var(--gold-dim);
+            border:1px solid var(--border);border-radius:6px;padding:2px 8px}}
+        .config-item{{display:flex;align-items:center;justify-content:space-between;
+            background:rgba(255,215,0,0.04);border:1px solid rgba(255,215,0,0.08);
+            border-radius:10px;padding:11px 12px;margin-bottom:8px;gap:8px}}
+        .config-icon{{width:32px;height:32px;border-radius:8px;background:var(--gold-dim);
+            display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:14px}}
+        .config-info{{flex:1;min-width:0}}
+        .config-name{{font-size:12.5px;font-weight:600;color:var(--text);
+            overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+        .config-type{{font-size:10px;color:var(--text3);margin-top:1px}}
+        .ping-badge{{margin-left:8px;font-weight:700}}
+        .config-actions{{display:flex;gap:5px;flex-shrink:0}}
+        .btn-copy{{padding:5px 10px;border-radius:7px;border:1px solid rgba(255,215,0,0.2);
+            background:var(--gold-dim);color:var(--gold);font-size:10.5px;font-weight:700;
+            cursor:pointer;transition:all .2s;font-family:inherit}}
+        .btn-copy:hover{{background:rgba(255,215,0,0.2)}}
+        .btn-qr{{padding:5px 10px;border-radius:7px;border:1px solid rgba(167,139,250,0.2);
+            background:rgba(167,139,250,0.08);color:#a78bfa;font-size:10.5px;font-weight:700;
+            cursor:pointer;transition:all .2s;font-family:inherit}}
+        .btn-qr:hover{{background:rgba(167,139,250,0.15)}}
+
+        /* Ping all btn */
+        .ping-btn{{width:100%;padding:14px;border-radius:12px;border:1px solid rgba(74,222,128,0.2);
+            background:rgba(74,222,128,0.08);color:var(--green);font-size:14px;font-weight:700;
+            cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;
+            font-family:inherit;transition:all .2s;margin-bottom:14px}}
+        .ping-btn:hover{{background:rgba(74,222,128,0.15);box-shadow:0 0 20px rgba(74,222,128,0.1)}}
+        .ping-btn:disabled{{opacity:0.6;cursor:wait}}
+
+        /* QR modal */
+        .mo{{position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:200;display:none;
+            align-items:center;justify-content:center;backdrop-filter:blur(8px)}}
+        .mo.show{{display:flex}}
+        .mo-box{{background:var(--surface2);border:1px solid var(--border2);border-radius:20px;
+            padding:24px;width:90%;max-width:300px;text-align:center;position:relative;
+            box-shadow:var(--gold-glow)}}
+        .mo-box img{{max-width:200px;border-radius:8px;border:3px solid var(--border);margin:12px 0}}
+        .mo-close{{position:absolute;top:12px;right:12px;background:var(--surface2);
+            border:1px solid var(--border);color:var(--text3);width:28px;height:28px;
+            border-radius:6px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px}}
+        .mo-title{{font-size:12px;font-weight:700;color:var(--gold);letter-spacing:1px;margin-bottom:4px}}
+
+        /* Toast */
+        .toast{{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(16px);
+            background:var(--bg2);color:var(--gold);border:1px solid var(--border2);
+            border-radius:10px;padding:10px 18px;font-size:13px;font-weight:600;
+            opacity:0;transition:all .3s;z-index:999;backdrop-filter:blur(20px);
+            box-shadow:var(--gold-glow)}}
+        .toast.show{{opacity:1;transform:translateX(-50%) translateY(0)}}
+
+        /* Luffy footer links */
+        .footer-links{{display:flex;justify-content:center;gap:16px;padding:20px 0 10px}}
+        .footer-link{{display:flex;align-items:center;gap:5px;color:var(--text3);
+            font-size:11px;font-weight:600;text-decoration:none;transition:color .2s}}
+        .footer-link:hover{{color:var(--gold)}}
     </style>
 </head>
 <body>
-    <div class="toast" id="toast">Copied!</div>
-    <div class="container">
-        <div class="brand">
-            <h1>LUFFY GATEWAY</h1>
-        </div>
-        <div class="card">
-            <div class="user-header">
-                <span class="username">{link['label']}</span>
-                <span class="status-badge {'status-active' if link['active'] else 'status-expired'}">
-                    {'Active' if link['active'] else 'Inactive'}
-                </span>
-            </div>
-            
-            <div class="progress-bar">
-                <div class="progress-fill" style="width: {pct}%"></div>
-            </div>
+<div class="bg-glow"></div>
+<div class="grid-bg"></div>
+<div class="starfield" id="starfield"></div>
+<div class="shooting-stars"><span class="star"></span><span class="star"></span><span class="star"></span><span class="star"></span><span class="star"></span></div>
+<div class="toast" id="toast"></div>
 
-            <div style="display:flex; justify-content: space-between; margin-top: 10px;">
-                <div>
-                    <div class="label">Usage</div>
-                    <div class="val">{usage_str}</div>
-                </div>
-                <div>
-                    <div class="label">Remaining</div>
-                    <div class="val">{rem_str}</div>
-                </div>
-            </div>
-        </div>
+<div class="container">
 
-        <div class="card">
-            <div class="label">Time Validity / Expiration</div>
-            <div class="val" style="color: #FFD700; font-size: 18px; font-weight: 700; margin-top: 4px;">{expiry_str}</div>
+    <!-- Header -->
+    <div class="header">
+        <div class="header-logo">
+            <svg width="28" height="24" viewBox="0 0 84 68" fill="none">
+                <ellipse cx="42" cy="52" rx="40" ry="11" fill="#C8900A" opacity=".85"/>
+                <ellipse cx="42" cy="52" rx="40" ry="11" fill="none" stroke="#FFD700" stroke-width="1.4" opacity=".6"/>
+                <path d="M19 50 Q21 22 42 17 Q63 22 65 50" fill="#4a3a00" stroke="#FFD700" stroke-width="1.4"/>
+                <ellipse cx="42" cy="17" rx="23" ry="5.5" fill="#C8900A" stroke="#FFD700" stroke-width="1"/>
+                <path d="M20 45 Q21.5 41.5 42 39.5 Q62.5 41.5 64 45" fill="none" stroke="#CC2200" stroke-width="4.5" stroke-linecap="round" opacity=".92"/>
+            </svg>
+            <span class="header-title">LUFFY</span>
         </div>
-
-        <h3 style="margin: 20px 0 10px 5px; font-size: 14px; letter-spacing: 1px; color: rgba(255,255,255,0.5);">AVAILABLE NODES</h3>
-        <div class="config-list" id="config-list"></div>
+        <div class="header-sub">{link['label']} · Connection Status</div>
     </div>
 
-    <div class="mo" id="qr-modal" onclick="if(event.target===this)this.classList.remove('show')">
-        <div class="mo-box">
-            <button class="mo-close" onclick="document.getElementById('qr-modal').classList.remove('show')">✕</button>
-            <h3 style="color:#FFD700; font-family:'Cinzel',serif; font-size:14px;">QR Code</h3>
-            <img id="qr-img" src="" alt="QR">
+    <!-- Usage Ring Card -->
+    <div class="ring-card">
+        <div class="ring-wrap">
+            <svg class="ring-svg" viewBox="0 0 160 160">
+                <defs>
+                    <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                        <stop offset="0%" style="stop-color:{ring_color1}"/>
+                        <stop offset="100%" style="stop-color:{ring_color2}"/>
+                    </linearGradient>
+                </defs>
+                <circle class="ring-bg" cx="80" cy="80" r="70"/>
+                <circle class="ring-fill" cx="80" cy="80" r="70"/>
+            </svg>
+            <div class="ring-center">
+                <div class="ring-pct">{pct:.0f}%</div>
+                <div class="ring-label">USED</div>
+            </div>
+        </div>
+
+        <div class="usage-nums">
+            {_fmt_bytes(used)} <span>/ {_fmt_bytes(limit) if limit > 0 else '∞'}</span>
+        </div>
+        <div class="usage-sub">{rem_str} remaining</div>
+
+        <div class="info-row">
+            <div class="info-box">
+                <div class="info-box-label">Status</div>
+                <div class="info-box-val {'green' if is_active else 'red'}">{status_text}</div>
+            </div>
+            <div class="info-box">
+                <div class="info-box-label">Expires</div>
+                <div class="info-box-val gold">{expiry_str}</div>
+                <div class="info-box-sub">{expiry_date_str}</div>
+            </div>
         </div>
     </div>
 
-    <script>
-        const configs = {configs_json};
-        const listEl = document.getElementById('config-list');
-        
-        function showToast(txt) {{
-            const t = document.getElementById('toast');
-            t.textContent = txt;
-            t.className = 'toast show';
-            clearTimeout(t.timer);
-            t.timer = setTimeout(() => t.className = 'toast', 2500);
+    <!-- QR Code Card -->
+    <div class="qr-card">
+        <div class="qr-label">Scan to Add</div>
+        <div class="qr-wrap">
+            <img src="https://api.qrserver.com/v1/create-qr-code/?size=240x240&color=000000&bgcolor=ffffff&data={quote(sub_url)}" alt="QR">
+        </div>
+        <div class="qr-label">Subscription Link</div>
+        <div class="sub-link-display" onclick="copySub()">{get_domain()}/sub/{uid}</div>
+        <button class="copy-sub-btn" onclick="copySub()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+            Copy Subscription Link
+        </button>
+    </div>
+
+    <!-- Easy Import Section -->
+    <div class="section-label">Easy Import</div>
+    <div class="platform-chips" id="platform-chips">
+        <div class="chip active" onclick="setPlatform('Android',this)"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" fill-rule="evenodd" style="vertical-align:-2px;margin-right:3px"><path d="M7.2 8h9.6a5 5 0 0 0-2-3.5l1-1.7a.35.35 0 0 0-.6-.35l-1.05 1.8A5.6 5.6 0 0 0 12 3.7c-.78 0-1.5.15-2.15.4L8.8 2.3a.35.35 0 0 0-.6.35l1 1.7A5 5 0 0 0 7.2 8zm2.55-1.6a.8.8 0 1 1 0-1.6.8.8 0 0 1 0 1.6zm4.5 0a.8.8 0 1 1 0-1.6.8.8 0 0 1 0 1.6zM6.5 9.2h11v8.3a1 1 0 0 1-1 1h-1.2v2.8a1.3 1.3 0 0 1-2.6 0v-2.8h-1.4v2.8a1.3 1.3 0 0 1-2.6 0v-2.8H7.5a1 1 0 0 1-1-1V9.2zM4 9.2a1.3 1.3 0 0 1 1.3 1.3v4.8a1.3 1.3 0 0 1-2.6 0v-4.8A1.3 1.3 0 0 1 4 9.2zm16 0a1.3 1.3 0 0 1 1.3 1.3v4.8a1.3 1.3 0 0 1-2.6 0v-4.8A1.3 1.3 0 0 1 20 9.2z"/></svg> Android</div>
+        <div class="chip" onclick="setPlatform('iOS',this)"><svg width="12" height="15" viewBox="0 0 384 512" fill="currentColor" style="vertical-align:-2px;margin-right:3px"><path d="M318.7 268.7c-.2-36.7 16.4-64.4 50-84.8-18.8-26.9-47.2-41.7-84.7-44.6-35.5-2.8-74.3 20.7-88.5 20.7-15 0-49.4-19.7-76.4-19.7C63.3 141.2 4 184.8 4 273.5q0 39.3 14.4 81.2c12.8 36.7 59 126.7 107.2 125.2 25.2-.6 43-17.9 75.8-17.9 31.8 0 48.3 17.9 76.4 17.9 48.6-.7 90.4-82.5 102.6-119.3-65.2-30.7-61.7-90-61.7-91.9zm-56.6-164.2c27.3-32.4 24.8-61.9 24-72.5-24.1 1.4-52 16.4-67.9 34.9-17.5 19.8-27.8 44.3-25.6 71.9 26.1 2 49.9-11.4 69.5-34.3z"/></svg> iOS</div>
+        <div class="chip" onclick="setPlatform('Windows',this)"><svg width="14" height="14" viewBox="0 0 448 512" fill="currentColor" style="vertical-align:-2px;margin-right:3px"><path d="M0 93.7l183.6-25.3v177.4H0V93.7zm0 324.6l183.6 25.3V268.4H0v149.9zm203.8 28L448 480V268.4H203.8v177.9zm0-380.6v180.1H448V32L203.8 65.7z"/></svg> Windows</div>
+        <div class="chip" onclick="setPlatform('macOS',this)"><svg width="12" height="15" viewBox="0 0 384 512" fill="currentColor" style="vertical-align:-2px;margin-right:3px"><path d="M318.7 268.7c-.2-36.7 16.4-64.4 50-84.8-18.8-26.9-47.2-41.7-84.7-44.6-35.5-2.8-74.3 20.7-88.5 20.7-15 0-49.4-19.7-76.4-19.7C63.3 141.2 4 184.8 4 273.5q0 39.3 14.4 81.2c12.8 36.7 59 126.7 107.2 125.2 25.2-.6 43-17.9 75.8-17.9 31.8 0 48.3 17.9 76.4 17.9 48.6-.7 90.4-82.5 102.6-119.3-65.2-30.7-61.7-90-61.7-91.9zm-56.6-164.2c27.3-32.4 24.8-61.9 24-72.5-24.1 1.4-52 16.4-67.9 34.9-17.5 19.8-27.8 44.3-25.6 71.9 26.1 2 49.9-11.4 69.5-34.3z"/></svg> macOS</div>
+        <div class="chip" onclick="setPlatform('Linux',this)"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" fill-rule="evenodd" style="vertical-align:-2px;margin-right:3px"><path d="M12 2c-2.6 0-4.3 2.1-4.3 4.8v4.4c0 1.3-.7 2.4-1.7 3.6-1.2 1.5-2.3 2.9-2.3 4.3 0 1.1.9 1.8 2 1.5l2.8-.8c.5 1.1 2 1.9 3.5 1.9s3-.8 3.5-1.9l2.8.8c1.1.3 2-.4 2-1.5 0-1.4-1.1-2.8-2.3-4.3-1-1.2-1.7-2.3-1.7-3.6V6.8C16.3 4.1 14.6 2 12 2zm-1.7 4.6a.9.9 0 1 1 0 1.8.9.9 0 0 1 0-1.8zm3.4 0a.9.9 0 1 1 0 1.8.9.9 0 0 1 0-1.8zM12 8.9l1.6 1.1c.3.2.3.6 0 .8L12 11.9l-1.6-1.1c-.3-.2-.3-.6 0-.8L12 8.9z"/></svg> Linux</div>
+        <div class="chip" onclick="setPlatform('AndroidTV',this)"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:-2px;margin-right:3px"><path d="M4 4h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-5v1.6l2.5 1.4v1h-11v-1L9 18.6V17H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm0 2v9h16V6H4z"/></svg> Android TV</div>
+        <div class="chip" onclick="setPlatform('AppleTV',this)"><svg width="12" height="15" viewBox="0 0 384 512" fill="currentColor" style="vertical-align:-2px;margin-right:3px"><path d="M318.7 268.7c-.2-36.7 16.4-64.4 50-84.8-18.8-26.9-47.2-41.7-84.7-44.6-35.5-2.8-74.3 20.7-88.5 20.7-15 0-49.4-19.7-76.4-19.7C63.3 141.2 4 184.8 4 273.5q0 39.3 14.4 81.2c12.8 36.7 59 126.7 107.2 125.2 25.2-.6 43-17.9 75.8-17.9 31.8 0 48.3 17.9 76.4 17.9 48.6-.7 90.4-82.5 102.6-119.3-65.2-30.7-61.7-90-61.7-91.9zm-56.6-164.2c27.3-32.4 24.8-61.9 24-72.5-24.1 1.4-52 16.4-67.9 34.9-17.5 19.8-27.8 44.3-25.6 71.9 26.1 2 49.9-11.4 69.5-34.3z"/></svg> Apple TV</div>
+    </div>
+
+    <div id="apps-container" class="apps-grid"></div>
+
+    <!-- Configs -->
+    <div class="configs-card">
+        <div class="configs-header">
+            <div class="configs-title">CONFIGS</div>
+            <div class="configs-count" id="configs-count">0 configs</div>
+        </div>
+        <button class="ping-btn" id="ping-all-btn" onclick="pingAll()">⚡ Ping test all</button>
+        <div id="config-list"></div>
+    </div>
+
+    <!-- Footer links -->
+    <div class="footer-links">
+        <a href="https://t.me/Luffy_sh_op" target="_blank" class="footer-link">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.032 9.57c-.148.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12l-6.871 4.326-2.962-.924c-.643-.204-.657-.643.136-.953l11.57-4.461c.537-.194 1.006.131.895.651z"/></svg>
+            Telegram Channel
+        </a>
+        <a href="https://t.me/chef_vpn" target="_blank" class="footer-link">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.032 9.57c-.148.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12l-6.871 4.326-2.962-.924c-.643-.204-.657-.643.136-.953l11.57-4.461c.537-.194 1.006.131.895.651z"/></svg>
+            Chef
+        </a>
+        <a href="https://github.com/luffy-sh-op/LUFFY_PANEL/tree/main" target="_blank" class="footer-link">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.374 0 0 5.373 0 12c0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0112 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z"/></svg>
+            GitHub
+        </a>
+    </div>
+
+</div>
+
+<!-- QR Modal -->
+<div class="mo" id="qr-modal" onclick="if(event.target===this)this.classList.remove('show')">
+    <div class="mo-box">
+        <button class="mo-close" onclick="document.getElementById('qr-modal').classList.remove('show')">✕</button>
+        <div class="mo-title">QR CODE</div>
+        <img id="qr-modal-img" src="" alt="QR">
+        <div id="qr-modal-name" style="font-size:11px;color:rgba(255,255,255,0.4);margin-bottom:8px"></div>
+        <button onclick="downloadQR()" style="width:100%;padding:10px;border-radius:8px;background:linear-gradient(135deg,#FFD700,#FFC200);border:none;color:#000;font-weight:700;font-size:13px;cursor:pointer;font-family:inherit">Download QR</button>
+    </div>
+</div>
+
+<script>
+    const configs = {configs_json};
+    const subUrl = "https://{get_domain()}/sub/{uid}";
+    (function(){{
+        var sf=document.getElementById('starfield');
+        if(!sf)return;
+        var n=window.innerWidth<600?70:130;
+        var h='';
+        for(var i=0;i<n;i++){{
+            var sz=(Math.random()*1.8+0.5).toFixed(2);
+            h+='<span class="s" style="width:'+sz+'px;height:'+sz+'px;top:'+(Math.random()*100).toFixed(2)+'%;left:'+(Math.random()*100).toFixed(2)+'%;animation-duration:'+(Math.random()*3+1.8).toFixed(2)+'s;animation-delay:'+(Math.random()*4).toFixed(2)+'s;opacity:'+(Math.random()*0.5+0.3).toFixed(2)+'"></span>';
+        }}
+        sf.innerHTML=h;
+    }})();
+    // Hiddify's own URL Scheme spec is: hiddify://import/<sublink>#<name>
+    // The #name fragment is what Hiddify shows as the profile name before
+    // it even fetches the sublink, and is used as a fallback if the
+    // content's own #profile-title header is missing or fails to parse.
+    const hiddifyProfileName = encodeURIComponent("Luffy-{link['label']}");
+    const hiddifyImportUrl = "hiddify://import/" + subUrl + "#" + hiddifyProfileName;
+
+    // Returns URL to the PNG icon for the given app name.
+    // Falls back to SVG initials if the PNG file does not exist.
+    function appIcon(name, bg) {{
+        const encoded = encodeURIComponent(name) + '.png';
+        return '/client/' + encoded;
+    }}
+
+    function appIconFallback(name, bg) {{
+        const initials = name.replace(/[^A-Za-z0-9 ]/g,'').trim().split(/\\s+/).map(w => w[0]).join('').substring(0,2).toUpperCase();
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="72" height="72">`
+            + `<rect width="72" height="72" rx="18" fill="${{bg}}"/>`
+            + `<text x="36" y="47" font-family="Arial,Helvetica,sans-serif" font-size="26" font-weight="700" fill="#fff" text-anchor="middle">${{initials}}</text>`
+            + `</svg>`;
+        return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+    }}
+
+    const APPS = {{
+        Android: [
+            {{name:"Hiddify", color:"#2F6FED", action:"Tap to open", url:hiddifyImportUrl}},
+            {{name:"v2rayNG", color:"#16A34A", action:"Tap to open", url:"v2rayng://install-sub?url=" + encodeURIComponent(subUrl)}},
+            {{name:"V2Box", color:"#F97316", action:"Tap to open", url:"v2box://install-sub?url=" + encodeURIComponent(subUrl)}},
+            {{name:"Happ", color:"#7C3AED", action:"Tap to open", url:"happ://add/" + encodeURIComponent(subUrl)}},
+            {{name:"NPV Tunnel", color:"#475569", action:"Tap to copy link", url:null}},
+            {{name:"clash mi", color:"#DC2626", action:"Tap to open", url:"clash://install-config?url=" + encodeURIComponent(subUrl), fallbackUrl:"clashmeta://install-config?url=" + encodeURIComponent(subUrl)}},
+        ],
+        iOS: [
+            {{name:"Hiddify", color:"#2F6FED", action:"Tap to open", url:hiddifyImportUrl}},
+            {{name:"Happ", color:"#7C3AED", action:"Tap to open", url:"happ://add/" + encodeURIComponent(subUrl)}},
+            {{name:"clash mi", color:"#DC2626", action:"Tap to open", url:"clash://install-config?url=" + encodeURIComponent(subUrl), fallbackUrl:"clashmeta://install-config?url=" + encodeURIComponent(subUrl)}},
+        ],
+        Windows: [
+            {{name:"Hiddify", color:"#2F6FED", action:"Tap to open", url:hiddifyImportUrl}},
+            {{name:"v2rayN", color:"#16A34A", action:"Tap to copy link", url:null}},
+            {{name:"clash mi", color:"#DC2626", action:"Tap to open", url:"clash://install-config?url=" + encodeURIComponent(subUrl)}},
+        ],
+        macOS: [
+            {{name:"Hiddify", color:"#2F6FED", action:"Tap to open", url:hiddifyImportUrl}},
+        ],
+        Linux: [
+            {{name:"Hiddify", color:"#2F6FED", action:"Tap to open", url:hiddifyImportUrl}},
+            {{name:"clash mi", color:"#DC2626", action:"Tap to open", url:"clash://install-config?url=" + encodeURIComponent(subUrl)}},
+        ],
+        AndroidTV: [
+            {{name:"Hiddify", color:"#2F6FED", action:"Tap to open", url:hiddifyImportUrl}},
+            {{name:"V2Box", color:"#F97316", action:"Tap to open", url:"v2box://install-sub?url=" + encodeURIComponent(subUrl)}},
+        ],
+        AppleTV: [
+            {{name:"Hiddify", color:"#2F6FED", action:"Tap to open", url:hiddifyImportUrl}},
+        ],
+    }};
+
+    let currentPlatform = 'Android';
+
+    function setPlatform(p, el) {{
+        currentPlatform = p;
+        document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+        if(el) el.classList.add('active');
+        renderApps();
+    }}
+
+    function renderApps() {{
+        const apps = APPS[currentPlatform] || [];
+        const container = document.getElementById('apps-container');
+        container.innerHTML = apps.map(a => `
+            <div class="app-card" onclick="openApp('${{a.url || ''}}', '${{a.name}}', '${{a.fallbackUrl || ''}}')">
+                <img src="${{appIcon(a.name, a.color)}}" alt="app"
+                    onerror="this.onerror=null;this.src=appIconFallback('${{a.name}}','${{a.color}}')"
+                    style="width:36px;height:36px;border-radius:8px;margin-bottom:8px;display:block">
+                <div class="app-name">${{a.name}}</div>
+                <div class="app-action">${{a.action}}</div>
+            </div>
+        `).join('');
+    }}
+
+    // Tries to open an app via custom URL scheme. If the app doesn't take over
+    // the page within a short window (meaning it isn't installed or the scheme
+    // didn't register), tries a fallback scheme, and if that also fails,
+    // copies the subscription link so the user can paste it manually.
+    function tryOpenScheme(url, onFail) {{
+        let didHide = false;
+        const onVisibilityChange = () => {{ if (document.hidden) didHide = true; }};
+        document.addEventListener('visibilitychange', onVisibilityChange);
+        window.addEventListener('blur', onVisibilityChange, {{ once: true }});
+
+        window.location.href = url;
+
+        setTimeout(() => {{
+            document.removeEventListener('visibilitychange', onVisibilityChange);
+            if (!didHide) {{
+                onFail();
+            }}
+        }}, 1500);
+    }}
+
+    function fallbackCopy(text) {{
+        try {{
+            var ta = document.createElement('textarea');
+            ta.value = text; ta.style.position = 'fixed'; ta.style.left = '-9999px';
+            document.body.appendChild(ta); ta.focus(); ta.select();
+            document.execCommand('copy'); document.body.removeChild(ta);
+        }} catch (e) {{}}
+    }}
+    function safeCopy(text) {{
+        try {{
+            if (navigator.clipboard && window.isSecureContext) {{
+                navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
+                return;
+            }}
+        }} catch (e) {{}}
+        fallbackCopy(text);
+    }}
+    function openApp(url, name, fallbackUrl) {{
+        if(!url) {{
+            safeCopy(subUrl);
+            showToast('لینک اشتراک کپی شد - ' + name + ' را باز کن و لینک را در آن پیست کن');
+            return;
         }}
 
-        function copyTxt(text) {{
-            navigator.clipboard.writeText(text)
-                .then(() => showToast('Copied Successfully!'))
-                .catch(() => showToast('Failed to copy.'));
-        }}
+        safeCopy(subUrl);
+        showToast('در حال باز کردن ' + name + ' - اگر خودکار اضافه نشد، لینک کپی شده؛ داخل اپ پیستش کن');
 
-        function showQR(text) {{
-            document.getElementById('qr-img').src = 'https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=' + encodeURIComponent(text);
-            document.getElementById('qr-modal').classList.add('show');
-        }}
+        tryOpenScheme(url, () => {{
+            if (fallbackUrl) {{
+                tryOpenScheme(fallbackUrl, () => {{
+                    safeCopy(subUrl);
+                    showToast(name + ' not detected - subscription link copied, paste it inside the app');
+                }});
+            }} else {{
+                safeCopy(subUrl);
+                showToast(name + ' not detected - subscription link copied, paste it inside the app');
+            }}
+        }});
+    }}
 
-        listEl.innerHTML = configs.map((cfg, i) => {{
+    // Render configs
+    function renderConfigs() {{
+        const list = document.getElementById('config-list');
+        document.getElementById('configs-count').textContent = configs.length + ' config' + (configs.length !== 1 ? 's' : '');
+        list.innerHTML = configs.map((cfg, i) => {{
             const parts = cfg.split('#');
-            const remark = parts[1] ? decodeURIComponent(parts[1]) : 'Node ' + (i+1);
+            const remark = parts[1] ? decodeURIComponent(parts[1]) : 'Config ' + (i+1);
             return `
                 <div class="config-item">
-                    <span class="config-name">${{remark}}</span>
-                    <div style="display:flex; gap: 5px;">
-                        <button class="btn btn-ghost" onclick="copyTxt('${{cfg}}')">Copy</button>
-                        <button class="btn btn-gold" onclick="showQR('${{cfg}}')">QR</button>
+                    <div class="config-icon">🌐</div>
+                    <div class="config-info">
+                        <div class="config-name">${{remark}}</div>
+                        <div class="config-type">VLESS · WS · TLS <span class="ping-badge" id="ping-badge-${{i}}">-</span></div>
+                    </div>
+                    <div class="config-actions">
+                        <button class="btn-copy" onclick="copyConfig('${{cfg.replace(/'/g,"\\'")}}')" title="Copy">Copy</button>
+                        <button class="btn-qr" onclick="showQR('${{cfg.replace(/'/g,"\\'")}}',' ${{remark}}')" title="QR">QR</button>
                     </div>
                 </div>
             `;
         }}).join('');
-    </script>
+    }}
+
+    function copySub() {{
+        safeCopy(subUrl);
+        showToast('Subscription link copied!');
+    }}
+
+    function copyConfig(txt) {{
+        safeCopy(txt);
+        showToast('Config copied!');
+    }}
+
+    function showQR(txt, name) {{
+        document.getElementById('qr-modal-img').src = 'https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=' + encodeURIComponent(txt);
+        document.getElementById('qr-modal-name').textContent = name || '';
+        document.getElementById('qr-modal').classList.add('show');
+    }}
+
+    function downloadQR() {{
+        const a = document.createElement('a');
+        a.href = document.getElementById('qr-modal-img').src;
+        a.download = 'luffy-config-qr.png';
+        a.click();
+    }}
+
+    // Extracts host:port from a vless:// config link
+    function parseHostPort(cfg) {{
+        const m = cfg.match(/@([^:/?#]+):(\\d+)/);
+        return m ? {{host: m[1], port: m[2]}} : null;
+    }}
+
+    // Asks the panel's own server to test connectivity to a config's host,
+    // so the ping result reflects the server's real network path (and isn't
+    // limited/blocked by the visitor's browser CORS rules).
+    async function pingHost(host, port) {{
+        try {{
+            const r = await fetch('/api/ping-check?host=' + encodeURIComponent(host) + '&port=' + encodeURIComponent(port));
+            if (!r.ok) return null;
+            const d = await r.json();
+            return d.reachable ? d.ms : null;
+        }} catch (e) {{
+            return null;
+        }}
+    }}
+
+    async function pingAll() {{
+        const btn = document.getElementById('ping-all-btn');
+        if (btn) {{ btn.disabled = true; btn.textContent = '⏳ Testing...'; }}
+        showToast('Testing ping for all configs...');
+
+        await Promise.all(configs.map(async (cfg, i) => {{
+            const badge = document.getElementById('ping-badge-' + i);
+            if (badge) {{ badge.textContent = '...'; badge.style.color = 'var(--text3)'; }}
+            const hp = parseHostPort(cfg);
+            if (!hp) {{
+                if (badge) {{ badge.textContent = 'N/A'; badge.style.color = 'var(--text3)'; }}
+                return;
+            }}
+            const ms = await pingHost(hp.host, hp.port);
+            if (!badge) return;
+            if (ms === null) {{
+                badge.textContent = 'Timeout';
+                badge.style.color = 'var(--red)';
+            }} else {{
+                badge.textContent = ms + ' ms';
+                badge.style.color = ms < 150 ? 'var(--green)' : ms < 400 ? 'var(--yellow)' : 'var(--red)';
+            }}
+        }}));
+
+        if (btn) {{ btn.disabled = false; btn.textContent = '⚡ Ping test all'; }}
+        showToast('Ping test complete');
+    }}
+
+    function showToast(msg) {{
+        const t = document.getElementById('toast');
+        t.textContent = msg;
+        t.className = 'toast show';
+        clearTimeout(t._t);
+        t._t = setTimeout(() => t.className = 'toast', 2500);
+    }}
+
+    renderApps();
+    renderConfigs();
+</script>
 </body>
 </html>"""
     return html
+
 
 def generate_subscription_content(link: dict, uid: str, addresses: list[str]) -> str:
     used = link["used_bytes"]
@@ -1394,14 +2450,139 @@ def generate_subscription_content(link: dict, uid: str, addresses: list[str]) ->
     else:
         expiry_str = f"{secs_left // 86400} Days Left"
     
-    status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0", port=DEFAULT_PORT)
-    links_out = [status_node]
-    
+    links_out = []
     links_out.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}", port=DEFAULT_PORT))
     for i, addr in enumerate(addresses):
         links_out.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}-IP{i+1}", address=addr, port=DEFAULT_PORT))
             
     return "\n".join(links_out)
+
+
+def generate_singbox_config(link: dict, uid: str, addresses: list[str]) -> str:
+    """Hiddify's engine is sing-box, so give it sing-box's own native
+    outbound JSON instead of the generic base64 vless list - removes any
+    dependency on Hiddify's vless://-URL parser entirely."""
+    domain = get_domain()
+
+    def _vless_outbound(tag: str, server: str, port: int = DEFAULT_PORT) -> dict:
+        return {
+            "type": "vless",
+            "tag": tag,
+            "server": server,
+            "server_port": port,
+            "uuid": uid,
+            "flow": "",
+            "tls": {
+                "enabled": True,
+                "server_name": domain,
+                "utls": {"enabled": True, "fingerprint": "chrome"},
+            },
+            "transport": {
+                "type": "ws",
+                "path": f"/ws/{uid}?ed=2048",
+                "headers": {"Host": domain},
+            },
+        }
+
+    tags = [f"Luffy-{link['label']}"]
+    outbounds = [_vless_outbound(tags[0], domain)]
+    for i, addr in enumerate(addresses):
+        tag = f"Luffy-{link['label']}-IP{i+1}"
+        tags.append(tag)
+        outbounds.append(_vless_outbound(tag, addr))
+
+    outbounds.append({"type": "direct", "tag": "direct"})
+    outbounds.append({"type": "block", "tag": "block"})
+    outbounds.append({
+        "type": "selector",
+        "tag": "proxy",
+        "outbounds": tags + ["direct"],
+        "default": tags[0],
+    })
+
+    config = {
+        "log": {"level": "warn"},
+        "dns": {"servers": [{"tag": "dns-remote", "address": "https://1.1.1.1/dns-query"}]},
+        "outbounds": outbounds,
+        "route": {"final": "proxy", "auto_detect_interface": True},
+    }
+    return json.dumps(config, ensure_ascii=False, indent=2)
+
+
+def generate_clash_config(link: dict, uid: str, addresses: list[str]) -> str:
+    domain = get_domain()
+    used = link["used_bytes"]
+    limit = link["limit_bytes"]
+    expires_at_str = link.get("expires_at")
+    usage_str = f"{_fmt_bytes(used)} / ∞" if limit == 0 else f"{_fmt_bytes(used)} / {_fmt_bytes(limit)}"
+    secs_left = seconds_until_expiry(expires_at_str)
+    if secs_left is None:
+        expiry_str = "∞"
+    elif secs_left == 0:
+        expiry_str = "Expired"
+    else:
+        expiry_str = f"{secs_left // 86400} Days Left"
+
+    def _proxy_entry(name: str, server: str, port: int = DEFAULT_PORT) -> str:
+        return (
+            f'  - name: "{name}"\n'
+            f'    type: vless\n'
+            f'    server: {server}\n'
+            f'    port: {port}\n'
+            f'    uuid: {uid}\n'
+            f'    tls: true\n'
+            f'    network: ws\n'
+            f'    ws-path: /ws/{uid}\n'
+            f'    ws-headers:\n'
+            f'      Host: {domain}\n'
+        )
+
+    proxies = []
+    proxies.append(_proxy_entry(f"Luffy-{link['label']}", domain))
+    for i, addr in enumerate(addresses):
+        proxies.append(_proxy_entry(f"Luffy-{link['label']}-IP{i+1}", addr))
+
+    proxies_yaml = "\n".join(proxies)
+    proxy_names = "\n".join(f'      - "{p}"' for p in [f"Luffy-{link['label']}"] + [f"Luffy-{link['label']}-IP{i+1}" for i in range(len(addresses))])
+
+    return (
+        f"# Luffy Panel - {link['label']}\n"
+        f"# {usage_str} | {expiry_str}\n"
+        f"port: 7890\n"
+        f"socks-port: 7891\n"
+        f"mode: rule\n"
+        f"log-level: info\n"
+        f"external-controller: 127.0.0.1:9090\n"
+        f"ipv6: true\n"
+        f"allow-lan: false\n"
+        f"find-process-mode: strict\n"
+        f"\n"
+        f"proxies:\n"
+        f"{proxies_yaml}\n"
+        f"\n"
+        f"proxy-groups:\n"
+        f'  - name: Proxy\n'
+        f'    type: select\n'
+        f'    proxies:\n'
+        f'{proxy_names}\n'
+        f'  - name: Auto\n'
+        f'    type: url-test\n'
+        f'    url: http://www.gstatic.com/generate_204\n'
+        f'    interval: 300\n'
+        f'    tolerance: 50\n'
+        f'    proxies:\n'
+        f'{proxy_names}\n'
+        f"\n"
+        f"rules:\n"
+        f"  - DOMAIN-SUFFIX,google.com,Proxy\n"
+        f"  - DOMAIN-SUFFIX,youtube.com,Proxy\n"
+        f"  - DOMAIN-SUFFIX,github.com,Proxy\n"
+        f"  - DOMAIN-SUFFIX,telegram.org,Proxy\n"
+        f"  - DOMAIN-KEYWORD,netflix,Proxy\n"
+        f"  - GEOIP,IR,DIRECT\n"
+        f"  - GEOSITE,cn,DIRECT\n"
+        f"  - MATCH,DIRECT\n"
+    )
 
 @app.get("/sub/{uid}")
 async def subscription_endpoint(uid: str, request: Request):
@@ -1423,28 +2604,62 @@ async def subscription_endpoint(uid: str, request: Request):
 
     ua = request.headers.get("user-agent", "").lower()
     accept = request.headers.get("accept", "").lower()
-    is_browser = any(x in ua for x in ["mozilla", "chrome", "safari", "opera", "edge"]) and "text/html" in accept
+
+    # Many VPN client apps (Hiddify, NapsternetV, v2rayNG, sing-box front-ends,
+    # etc.) use HTTP libraries (Dio/OkHttp/etc.) that sometimes send a
+    # browser-like User-Agent and/or a permissive Accept header for
+    # compatibility with CDNs. If we only check for "mozilla"+"text/html" we
+    # misclassify these real clients as browsers and hand them the HTML
+    # landing page, which they can't parse ("unable to determine config
+    # format"). So known client fingerprints are checked FIRST and always
+    # win, regardless of what Accept/UA otherwise look like.
+    known_client_markers = [
+        "hiddify", "napsternet", "v2rayng", "v2box", "nekoray", "nekobox",
+        "sing-box", "singbox", "streisand", "karing", "shadowrocket",
+        "quantumult", "surge", "loon", "matsuri", "husi", "clash", "stash",
+        "verge", "clashx", "clashmeta", "cfw", "dart", "okhttp",
+    ]
+    is_known_client = any(x in ua for x in known_client_markers)
+
+    is_browser = (
+        not is_known_client
+        and any(x in ua for x in ["mozilla", "chrome", "safari", "opera", "edge"])
+        and "text/html" in accept
+    )
 
     if is_browser:
         return HTMLResponse(content=generate_landing_page(link, uid, addresses))
 
-    sub_content = generate_subscription_content(link, uid, addresses)
-    encoded = base64.b64encode(sub_content.encode()).decode()
+    is_clash = ("hiddify" not in ua) and any(x in ua for x in ["clash", "stash", "verge", "clashx", "clashmeta", "cfw"])
+
     total_bytes = link["limit_bytes"] if link["limit_bytes"] > 0 else UNLIMITED_QUOTA_BYTES
     expire_ts = 0
     if expires_at is not None:
         expire_ts = int(expires_at.timestamp())
-        
+
+    if is_clash:
+        clash_content = generate_clash_config(link, uid, addresses)
+        headers = {
+            "Content-Type": "text/yaml; charset=utf-8",
+            "Content-Disposition": 'attachment; filename="clash.yaml"',
+            "profile-update-interval": "6",
+            "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={total_bytes}; expire={expire_ts}",
+        }
+        return Response(content=clash_content, headers=headers)
+
+    sub_content = generate_subscription_content(link, uid, addresses)
+
     headers = {
         "Content-Type": "text/plain; charset=utf-8",
-        "Content-Disposition": 'attachment; filename="sub.txt"',
         "profile-update-interval": "6",
+        "profile-title": "base64:" + base64.b64encode(f"Luffy-{link['label']}".encode()).decode(),
         "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={total_bytes}; expire={expire_ts}",
     }
+
+    encoded = base64.b64encode(sub_content.encode()).decode()
     return Response(content=encoded, headers=headers)
 
-# ── WebSocket tunnel ──────────────────────────────────────────────────────────
-RELAY_BUF = 64 * 1024
+RELAY_BUF = 128 * 1024
 
 async def parse_vless_header(first_chunk: bytes):
     if len(first_chunk) < 24:
@@ -1492,6 +2707,27 @@ async def add_usage(uid: str, n: int):
         if uid in LINKS:
             LINKS[uid]["used_bytes"] += n
 
+async def check_and_add_usage(uid: str, extra_bytes: int) -> bool:
+    """Atomically check quota/expiry/active state and commit usage in a
+    single lock acquisition. Doing this as two separate locked calls
+    (check_quota then add_usage) let concurrent chunks - e.g. the upload
+    and download directions of the same connection racing each other -
+    both pass the check before either had committed, which could push a
+    link's used_bytes past its limit. It also doubled lock contention on
+    every single packet relayed, which was a real throughput bottleneck
+    under load. This does both in one step."""
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+        if link is None or not link["active"]:
+            return False
+        expires_at = parse_expires_at(link.get("expires_at"))
+        if expires_at is not None and expires_at < datetime.now(timezone.utc):
+            return False
+        if link["limit_bytes"] != 0 and (link["used_bytes"] + extra_bytes) > link["limit_bytes"]:
+            return False
+        link["used_bytes"] += extra_bytes
+        return True
+
 async def ws_to_tcp(websocket, writer, conn_id, link_uid):
     try:
         while True:
@@ -1502,7 +2738,7 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
             if not data:
                 continue
             size = len(data)
-            if not await check_quota(link_uid, size):
+            if not await check_and_add_usage(link_uid, size):
                 await websocket.close(code=1008, reason="quota exceeded")
                 break
             stats["total_bytes"] += size
@@ -1510,9 +2746,9 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
             async with connections_lock:
                 if conn_id in connections:
                     connections[conn_id]["bytes"] += size
-            hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
-            daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
-            await add_usage(link_uid, size)
+            now = datetime.now(timezone.utc)
+            hourly_traffic[now.strftime("%Y-%m-%d %H:00")] += size
+            daily_traffic[now.strftime("%Y-%m-%d")] += size
             try:
                 writer.write(data)
                 await writer.drain()
@@ -1537,16 +2773,16 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid):
             if not data:
                 break
             size = len(data)
-            if not await check_quota(link_uid, size):
+            if not await check_and_add_usage(link_uid, size):
                 await websocket.close(code=1008, reason="quota exceeded")
                 break
             stats["total_bytes"] += size
             async with connections_lock:
                 if conn_id in connections:
                     connections[conn_id]["bytes"] += size
-            hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
-            daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
-            await add_usage(link_uid, size)
+            now = datetime.now(timezone.utc)
+            hourly_traffic[now.strftime("%Y-%m-%d %H:00")] += size
+            daily_traffic[now.strftime("%Y-%m-%d")] += size
             try:
                 await websocket.send_bytes((b"\x00\x00" + data) if first else data)
                 first = False
@@ -1559,16 +2795,6 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid):
 async def websocket_tunnel(websocket: WebSocket, uuid: str):
     await ensure_default_link()
 
-    # IMPORTANT: all validation that doesn't require reading client data
-    # happens BEFORE accept(). Calling websocket.close() before accept()
-    # makes the ASGI server reply with a plain HTTP 403 instead of
-    # completing the WebSocket upgrade (101) and then dropping the
-    # connection. The latter is a strong, easily-scriptable fingerprint
-    # for active-probing systems: "this server fully completes a WS
-    # handshake for literally any /ws/<uuid> path, then closes it" is
-    # exactly the kind of behavior DPI/censor probes look for. Rejecting
-    # pre-handshake makes invalid requests look like a normal closed/
-    # forbidden endpoint instead of a live VLESS server.
     async with LINKS_LOCK:
         link_data = LINKS.get(uuid)
         if link_data is None or not link_data["active"]:
@@ -1588,17 +2814,34 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             await websocket.close(code=1008)
             return
 
-    await websocket.accept()
+    # Xray/V2Ray clients that request early data (ws ?ed=... in the link)
+    # smuggle the first chunk of the VLESS request inside the
+    # Sec-WebSocket-Protocol header of the upgrade request itself, so it
+    # arrives in the same TCP packet as the handshake instead of a separate
+    # round trip after accept(). Echoing the header back keeps the handshake
+    # spec-compliant for clients that check it.
+    early_data_hdr = websocket.headers.get("sec-websocket-protocol")
+    early_data = b""
+    if early_data_hdr:
+        try:
+            padded = early_data_hdr + "=" * (-len(early_data_hdr) % 4)
+            early_data = base64.urlsafe_b64decode(padded)
+        except Exception:
+            early_data = b""
+    await websocket.accept(subprotocol=early_data_hdr if early_data_hdr else None)
     writer = None
     conn_id = None
     client_ip = get_client_ip(websocket)
     try:
-        first_msg = await asyncio.wait_for(websocket.receive(), timeout=15.0)
-        if first_msg["type"] == "websocket.disconnect":
-            return
-        first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
-        if not first_chunk:
-            return
+        if early_data:
+            first_chunk = early_data
+        else:
+            first_msg = await asyncio.wait_for(websocket.receive(), timeout=15.0)
+            if first_msg["type"] == "websocket.disconnect":
+                return
+            first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
+            if not first_chunk:
+                return
 
         try:
             command, address, port, initial_payload = await parse_vless_header(first_chunk)
@@ -1617,19 +2860,38 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             connection_sockets[conn_id] = websocket
             link_ip_map[uuid].add(client_ip)
 
+        await _log_connection_event("connect", link_data_copy.get("label", uuid), uuid, client_ip)
+
         size = len(first_chunk)
+        if not await check_and_add_usage(uuid, size):
+            await websocket.close(code=1008, reason="quota exceeded")
+            return
         stats["total_bytes"] += size
         stats["total_requests"] += 1
         async with connections_lock:
             if conn_id in connections:
                 connections[conn_id]["bytes"] += size
-        hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
-        daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
-        await add_usage(uuid, size)
+        now = datetime.now(timezone.utc)
+        hourly_traffic[now.strftime("%Y-%m-%d %H:00")] += size
+        daily_traffic[now.strftime("%Y-%m-%d")] += size
 
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(address, port), timeout=10.0
         )
+        # Disable Nagle's algorithm on the backend TCP socket. Without this,
+        # small proxied packets (the common case for interactive/streaming
+        # traffic) can sit buffered for up to ~40ms waiting to be coalesced,
+        # which is felt as real added latency/slowness on every config.
+        try:
+            backend_sock = writer.get_extra_info("socket")
+            if backend_sock is not None:
+                backend_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except (OSError, AttributeError):
+            pass
+
+        if initial_payload and not await check_and_add_usage(uuid, len(initial_payload)):
+            await websocket.close(code=1008, reason="quota exceeded")
+            return
 
         if initial_payload:
             p_size = len(initial_payload)
@@ -1637,9 +2899,9 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             async with connections_lock:
                 if conn_id in connections:
                     connections[conn_id]["bytes"] += p_size
-            hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += p_size
-            daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += p_size
-            await add_usage(uuid, p_size)
+            now = datetime.now(timezone.utc)
+            hourly_traffic[now.strftime("%Y-%m-%d %H:00")] += p_size
+            daily_traffic[now.strftime("%Y-%m-%d")] += p_size
             try:
                 writer.write(initial_payload)
                 await writer.drain()
@@ -1662,6 +2924,10 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         stats["total_errors"] += 1
         error_logs.append({"error": str(exc), "time": datetime.now(timezone.utc).isoformat()})
         logger.exception("WebSocket error")
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
     finally:
         if writer:
             try:
@@ -1686,14 +2952,24 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
                                 link_ip_map[uid].discard(ip)
                                 if not link_ip_map[uid]:
                                     link_ip_map.pop(uid, None)
+            if info:
+                try:
+                    connected_at = datetime.fromisoformat(info["connected_at"])
+                    duration_s = max(0, int((datetime.now(timezone.utc) - connected_at).total_seconds()))
+                except Exception:
+                    duration_s = 0
+                async with LINKS_LOCK:
+                    label = LINKS.get(info.get("uuid"), {}).get("label", info.get("uuid", uuid))
+                extra = f"duration {duration_s}s, {_fmt_bytes(info.get('bytes', 0))}"
+                await _log_connection_event("disconnect", label, info.get("uuid", uuid), info.get("ip", client_ip), extra)
 
-# ── HTML ──────────────────────────────────────────────────────────────────────
+# ── HTML Panel (Gold/Neon Theme) ─────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title data-en="Luffy Panel" data-fa="LUFFY PANEL">Luffy Panel</title>
+<title>Luffy Panel</title>
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
@@ -1704,54 +2980,96 @@ PANEL_HTML = r"""<!DOCTYPE html>
   --surface:rgba(12,12,18,0.97);--surface2:rgba(20,20,28,0.9);--surface3:rgba(28,28,40,0.8);
   --border:rgba(255,215,0,0.1);--border2:rgba(255,215,0,0.2);
   --text:rgba(255,255,255,0.92);--text2:rgba(255,215,0,0.7);--text3:rgba(255,255,255,0.4);
-  --white-neon:rgba(255,255,255,0.85);--white-glow:0 0 16px rgba(255,255,255,0.25);
   --gold-glow:0 0 20px rgba(255,215,0,0.4);
   --green:#4ade80;--green-dim:rgba(74,222,128,0.1);
   --red:#f87171;--red-dim:rgba(248,113,113,0.1);
   --yellow:#fbbf24;
   --nav-w:64px;
 }
-body.light-mode {
-  --black: #f0f2f5; --black2: #ffffff; --black3: #e4e6eb;
-  --surface: rgba(255,255,255,0.95); --surface2: #ffffff; --surface3: #f9fafb;
-  --border: rgba(0,0,0,0.1); --border2: rgba(0,0,0,0.2);
-  --text: #111827; --text2: #4b5563; --text3: #6b7280;
-  --gold-dim: rgba(218, 165, 32, 0.15);
-  --gold-glow: 0 4px 14px rgba(0,0,0,0.1);
+body.light-mode{
+  --black:#f0f4f8;--black2:#ffffff;--black3:#e8eef5;
+  --surface:rgba(255,255,255,0.97);--surface2:#ffffff;--surface3:#f8fafc;
+  --border:rgba(255,215,0,0.15);--border2:rgba(255,215,0,0.3);
+  --text:#0f172a;--text2:#0891b2;--text3:#64748b;
+  --gold-dim:rgba(255,215,0,0.1);--gold-dim2:rgba(255,215,0,0.06);
+  --gold-glow:0 4px 14px rgba(0,0,0,0.08);
 }
-html,body{height:100%;background:var(--black);transition: background 0.3s, color 0.3s;}
-body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;min-height:100vh;}
+html,body{height:100%;background:var(--black);transition:background .3s,color .3s}
+body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;min-height:100vh}
 body[dir="rtl"]{direction:rtl;text-align:right}
 ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:rgba(255,215,0,0.2);border-radius:4px}
-.bg-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background:radial-gradient(ellipse 70% 50% at 50% -10%,var(--gold-dim),transparent 60%)}
-.grid-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background-image:linear-gradient(rgba(128,128,128,0.05) 1px,transparent 1px),linear-gradient(90deg,rgba(128,128,128,0.05) 1px,transparent 1px);background-size:56px 56px}
-.sidebar{position:fixed;left:0;top:0;bottom:0;width:var(--nav-w);background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;z-index:100;transition:all .3s cubic-bezier(.4,0,.2,1);backdrop-filter:blur(20px);}
-.sidebar::after{content:'';position:absolute;top:0;right:0;bottom:0;width:1px;background:linear-gradient(180deg,transparent,rgba(255,215,0,0.3) 30%,rgba(255,215,0,0.3) 70%,transparent)}
-.light-mode .sidebar::after{display:none;}
-.sb-brand{padding:16px 0;display:flex;flex-direction:column;align-items:center;gap:2px;border-bottom:1px solid var(--border);flex-shrink:0}
-.sb-hat{filter:drop-shadow(0 0 10px rgba(255,215,0,.6));transition:filter .3s}
+.bg-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;
+  background:radial-gradient(ellipse 70% 50% at 50% -10%,rgba(255,215,0,0.07),transparent 60%),
+             radial-gradient(ellipse 40% 30% at 90% 90%,rgba(255,215,0,0.04),transparent 50%)}
+.light-mode .bg-fixed{background:none}
+.grid-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;
+  background-image:linear-gradient(rgba(255,215,0,0.04) 1px,transparent 1px),
+                   linear-gradient(90deg,rgba(255,215,0,0.04) 1px,transparent 1px);
+  background-size:56px 56px}
+.light-mode .grid-fixed{opacity:.4}
+
+/* Sidebar */
+.sidebar{position:fixed;left:0;top:0;bottom:0;width:var(--nav-w);background:var(--surface);
+  border-right:1px solid var(--border);display:flex;flex-direction:column;z-index:100;
+  transition:all .3s cubic-bezier(.4,0,.2,1);backdrop-filter:blur(20px)}
+.sidebar::after{content:'';position:absolute;top:0;right:0;bottom:0;width:1px;
+  background:linear-gradient(180deg,transparent,rgba(255,215,0,0.4) 30%,rgba(255,215,0,0.4) 70%,transparent)}
+.light-mode .sidebar::after{display:none}
+.sb-brand{padding:16px 0;display:flex;flex-direction:column;align-items:center;gap:2px;
+  border-bottom:1px solid var(--border);flex-shrink:0}
+.sb-hat{filter:drop-shadow(0 0 10px rgba(255,215,0,.5));transition:filter .3s}
 .sb-hat:hover{filter:drop-shadow(0 0 18px rgba(255,215,0,.9))}
-.sb-title{font-family:'Cinzel',serif;font-size:8px;letter-spacing:.18em;color:rgba(255,215,0,.6);text-transform:uppercase;white-space:nowrap;overflow:hidden}
-.sb-nav{flex:1;display:flex;flex-direction:column;justify-content:flex-end;padding-bottom:12px;gap:2px;padding-left:8px;padding-right:8px}
-.nav-item{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:10px 6px;border-radius:12px;color:var(--text3);cursor:pointer;transition:all .2s cubic-bezier(.4,0,.2,1);border:1px solid transparent;position:relative;overflow:hidden;text-decoration:none;background:none;width:100%;font-family:inherit;}
-.nav-item::before{content:'';position:absolute;inset:0;border-radius:12px;background:linear-gradient(135deg,var(--gold-dim),transparent);opacity:0;transition:opacity .2s}
+.sb-title{font-family:'Cinzel',serif;font-size:8px;letter-spacing:.18em;color:rgba(255,215,0,.6);
+  text-transform:uppercase;white-space:nowrap;overflow:hidden}
+.sb-nav{flex:1;display:flex;flex-direction:column;justify-content:flex-end;padding-bottom:12px;
+  gap:2px;padding-left:8px;padding-right:8px}
+.nav-item{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+  padding:10px 6px;border-radius:12px;color:var(--text3);cursor:pointer;
+  transition:all .2s cubic-bezier(.4,0,.2,1);border:1px solid transparent;position:relative;
+  overflow:hidden;text-decoration:none;background:none;width:100%;font-family:inherit}
+.nav-item::before{content:'';position:absolute;inset:0;border-radius:12px;
+  background:linear-gradient(135deg,var(--gold-dim),transparent);opacity:0;transition:opacity .2s}
 .nav-item:hover{color:var(--gold);border-color:rgba(255,215,0,.12)}
 .nav-item:hover::before{opacity:1}
-.nav-item.active{color:var(--gold);border-color:rgba(255,215,0,.22);background:var(--gold-dim);box-shadow:0 0 16px rgba(255,215,0,.1),inset 0 1px 0 rgba(255,215,0,.12)}
+.nav-item.active{color:var(--gold);border-color:rgba(255,215,0,.22);background:var(--gold-dim);
+  box-shadow:0 0 16px rgba(255,215,0,.1),inset 0 1px 0 rgba(255,215,0,.12)}
 .nav-item.active::before{opacity:1}
 .nav-icon{width:18px;height:18px;flex-shrink:0;transition:transform .2s}
 .nav-item:hover .nav-icon,.nav-item.active .nav-icon{transform:scale(1.1)}
 .nav-label{font-size:8.5px;font-weight:600;letter-spacing:.05em;white-space:nowrap;overflow:hidden}
-.nav-badge{position:absolute;top:5px;right:5px;background:var(--gold);color:#000;font-size:8px;font-weight:800;min-width:14px;height:14px;border-radius:7px;display:flex;align-items:center;justify-content:center;padding:0 3px}
+.nav-badge{position:absolute;top:5px;right:5px;background:var(--gold);color:#000;font-size:8px;
+  font-weight:800;min-width:14px;height:14px;border-radius:7px;display:flex;align-items:center;
+  justify-content:center;padding:0 3px}
 .sb-bottom{padding:8px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:6px;flex-shrink:0}
 .lang-row{display:flex;gap:4px}
-.lang-btn{flex:1;padding:5px 2px;border:1px solid var(--border);border-radius:7px;background:none;color:var(--text3);font-size:9px;font-weight:700;cursor:pointer;transition:all .2s;font-family:inherit;letter-spacing:.05em}
+.lang-btn{flex:1;padding:5px 2px;border:1px solid var(--border);border-radius:7px;background:none;
+  color:var(--text3);font-size:9px;font-weight:700;cursor:pointer;transition:all .2s;
+  font-family:inherit;letter-spacing:.05em}
 .lang-btn.active{background:var(--gold-dim);border-color:var(--gold);color:var(--gold)}
 .lang-btn:hover:not(.active){border-color:rgba(255,215,0,.15);color:rgba(255,215,0,.5)}
-.logout-btn{display:flex;align-items:center;justify-content:center;padding:7px;border:1px solid rgba(248,113,113,.15);border-radius:8px;background:rgba(248,113,113,.06);color:rgba(248,113,113,.6);cursor:pointer;transition:all .2s;font-size:10px;gap:4px;font-weight:600;font-family:inherit}
+.logout-btn{display:flex;align-items:center;justify-content:center;padding:7px;
+  border:1px solid rgba(248,113,113,.15);border-radius:8px;background:rgba(248,113,113,.06);
+  color:rgba(248,113,113,.6);cursor:pointer;transition:all .2s;font-size:10px;gap:4px;
+  font-weight:600;font-family:inherit}
 .logout-btn:hover{background:rgba(248,113,113,.12);border-color:rgba(248,113,113,.3);color:var(--red)}
-.theme-toggle{background:transparent;border:1px solid var(--border);color:var(--text3);border-radius:7px;padding:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s;}
-.theme-toggle:hover{background:var(--surface3);color:var(--gold);border-color:var(--gold);}
+.theme-toggle{background:transparent;border:1px solid var(--border);color:var(--text3);
+  border-radius:7px;padding:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;
+  transition:all .2s}
+.theme-toggle:hover{background:var(--surface3);color:var(--gold);border-color:var(--gold)}
+
+/* Social links in sidebar */
+.sb-social{display:flex;gap:4px;margin-bottom:2px}
+.sb-social-btn{flex:1;display:flex;align-items:center;justify-content:center;padding:7px 4px;
+  border:1px solid var(--border);border-radius:8px;color:var(--text3);cursor:pointer;
+  transition:all .2s;text-decoration:none;background:none}
+.sb-social-btn:hover{border-color:var(--border2);color:var(--gold);background:var(--gold-dim);
+  box-shadow:0 0 10px rgba(255,215,0,0.1)}
+.sb-social-btn svg{width:14px;height:14px}
+.mob-social{display:none;gap:8px;align-items:center}
+.mob-social .sb-social-btn{padding:7px}
+.mob-social .sb-social-btn svg{width:16px;height:16px}
+
+/* Main */
 .main{margin-left:var(--nav-w);flex:1;padding:24px 28px 48px;min-height:100vh;position:relative;z-index:1}
 .page{display:none;animation:pgIn .35s ease}
 .page.active{display:block}
@@ -1760,22 +3078,27 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .page-title{font-family:'Cinzel',serif;font-size:16px;font-weight:700;color:var(--text);letter-spacing:.04em}
 .page-sub{font-size:11px;color:var(--text3);margin-top:3px;letter-spacing:.02em}
 .stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
-.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:16px;position:relative;overflow:hidden;transition:all .25s;animation:cIn .5s ease both}
-.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,215,0,0.4),transparent)}
-.light-mode .stat-card::before{display:none;}
+.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;
+  padding:16px;position:relative;overflow:hidden;transition:all .25s;animation:cIn .5s ease both}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(255,215,0,0.4),transparent)}
+.light-mode .stat-card::before{display:none}
 .stat-card:hover{border-color:var(--border2);transform:translateY(-2px);box-shadow:var(--gold-glow)}
 @keyframes cIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
 .stat-label{font-size:9.5px;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
 .stat-val{font-size:20px;font-weight:700;color:var(--text);letter-spacing:-.02em}
 .stat-unit{font-size:11px;font-weight:400;color:var(--text3)}
-.card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:10px;position:relative;overflow:hidden;transition:all .25s;animation:cIn .5s ease both}
-.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,215,0,0.25),transparent)}
-.light-mode .card::before{display:none;}
+.card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:16px;
+  margin-bottom:10px;position:relative;overflow:hidden;transition:all .25s;animation:cIn .5s ease both}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(255,215,0,0.2),transparent)}
+.light-mode .card::before{display:none}
 .card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
 .card-title{font-size:12px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:6px}
 .chart-container{height:170px;width:100%}
-.btn{font-family:inherit;font-size:11.5px;font-weight:700;border-radius:8px;padding:7px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;border:none;transition:all .2s;letter-spacing:.03em}
-.btn-gold{background:linear-gradient(135deg,#FFD700,#C8900A);color:#000;box-shadow:0 0 16px rgba(255,215,0,.25)}
+.btn{font-family:inherit;font-size:11.5px;font-weight:700;border-radius:8px;padding:7px 14px;
+  cursor:pointer;display:inline-flex;align-items:center;gap:5px;border:none;transition:all .2s;letter-spacing:.03em}
+.btn-gold{background:linear-gradient(135deg,#FFD700,#FFC200);color:#000;box-shadow:0 0 16px rgba(255,215,0,.25)}
 .btn-gold:hover{filter:brightness(1.1);transform:translateY(-1px);box-shadow:0 0 24px rgba(255,215,0,.4)}
 .btn-ghost{background:var(--surface3);color:var(--text);border:1px solid var(--border)}
 .btn-danger{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,.15)}
@@ -1783,9 +3106,11 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .tbl-wrap{overflow-x:auto}
 .tbl{width:100%;border-collapse:collapse}
-.tbl th{text-align:left;font-size:9.5px;font-weight:700;color:var(--text3);padding:9px 11px;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border);background:var(--surface3)}
+.tbl th{text-align:left;font-size:9.5px;font-weight:700;color:var(--text3);padding:9px 11px;
+  text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border);background:var(--surface3)}
 .tbl td{padding:9px 11px;border-bottom:1px solid var(--border);font-size:12.5px;vertical-align:middle}
-.tag{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:9px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}
+.tag{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:9px;
+  font-weight:800;letter-spacing:.05em;text-transform:uppercase}
 .tag-vless{background:var(--gold-dim);color:var(--gold);border:1px solid var(--border)}
 .tag-port{background:rgba(167,139,250,.1);color:#a78bfa;border:1px solid rgba(167,139,250,.2)}
 .tag-on{background:var(--green-dim);color:var(--green);border:1px solid rgba(74,222,128,.2)}
@@ -1795,8 +3120,10 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .pill-bar{flex:1;height:4px;background:var(--border);border-radius:2px;min-width:40px}
 .pill-fill{height:100%;border-radius:2px;transition:width .4s}
 .pill-lim{color:var(--text3);font-size:10px}
-.toggle{width:32px;height:17px;border-radius:9px;background:var(--surface3);position:relative;cursor:pointer;transition:all .28s;border:1px solid var(--border);flex-shrink:0}
-.toggle::after{content:'';position:absolute;width:11px;height:11px;border-radius:50%;background:var(--text3);top:2px;left:2px;transition:all .28s cubic-bezier(.4,0,.2,1)}
+.toggle{width:32px;height:17px;border-radius:9px;background:var(--surface3);position:relative;
+  cursor:pointer;transition:all .28s;border:1px solid var(--border);flex-shrink:0}
+.toggle::after{content:'';position:absolute;width:11px;height:11px;border-radius:50%;
+  background:var(--text3);top:2px;left:2px;transition:all .28s cubic-bezier(.4,0,.2,1)}
 .toggle.on{background:var(--green);border-color:var(--green);box-shadow:0 0 10px rgba(74,222,128,.3)}
 .toggle.on::after{left:17px;background:#fff}
 .sys-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
@@ -1806,129 +3133,141 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .sl-v{color:var(--text);font-weight:600;font-size:11.5px}
 .fg{display:flex;flex-direction:column;gap:4px;margin-bottom:11px}
 .fl{font-size:9.5px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.08em}
-.fi,.fs{padding:8px 12px;border-radius:8px;border:1px solid var(--border);font-family:inherit;font-size:12.5px;outline:none;color:var(--text);background:var(--surface);transition:all .2s}
+.fi,.fs{padding:8px 12px;border-radius:8px;border:1px solid var(--border);font-family:inherit;
+  font-size:12.5px;outline:none;color:var(--text);background:var(--surface);transition:all .2s}
 .fi:focus,.fs:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(255,215,0,.08)}
 .fr{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
 .fr .fg{margin-bottom:0;flex:1;min-width:90px}
-.act-btn{font-family:inherit;font-size:9.5px;font-weight:700;border-radius:6px;padding:4px 8px;cursor:pointer;display:inline-flex;align-items:center;gap:3px;border:1px solid;transition:all .18s}
+.act-btn{font-family:inherit;font-size:9.5px;font-weight:700;border-radius:6px;padding:4px 8px;
+  cursor:pointer;display:inline-flex;align-items:center;gap:3px;border:1px solid;transition:all .18s}
 .act-copy{background:var(--gold-dim);color:var(--gold);border-color:var(--border)}
 .act-sub{background:var(--green-dim);color:var(--green);border-color:rgba(74,222,128,.2)}
 .act-qr{background:rgba(167,139,250,.1);color:#a78bfa;border-color:rgba(167,139,250,.2)}
 .act-edit{background:rgba(251,191,36,.08);color:var(--yellow);border-color:rgba(251,191,36,.2)}
 .act-del{background:var(--red-dim);color:var(--red);border-color:rgba(248,113,113,.18)}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(16px);background:var(--surface);color:var(--text);border:1px solid var(--border2);border-radius:10px;padding:12px 20px;font-size:13px;font-weight:600;opacity:0;transition:all .3s;z-index:999;backdrop-filter:blur(24px);box-shadow:var(--gold-glow)}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(16px);
+  background:var(--surface);color:var(--gold);border:1px solid var(--border2);border-radius:10px;
+  padding:12px 20px;font-size:13px;font-weight:600;opacity:0;transition:all .3s;z-index:999;
+  backdrop-filter:blur(24px);box-shadow:var(--gold-glow)}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-.mo{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(8px)}
+.mo{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;display:none;
+  align-items:center;justify-content:center;backdrop-filter:blur(8px)}
 .mo.show{display:flex}
-.mo-box{background:var(--surface2);border:1px solid var(--border2);border-radius:18px;padding:24px;width:100%;max-width:460px;position:relative;box-shadow:var(--gold-glow);transform:scale(.92);opacity:0;transition:all .38s cubic-bezier(.34,1.56,.64,1)}
+.mo-box{background:var(--surface2);border:1px solid var(--border2);border-radius:18px;padding:24px;
+  width:100%;max-width:460px;position:relative;box-shadow:var(--gold-glow);
+  transform:scale(.92);opacity:0;transition:all .38s cubic-bezier(.34,1.56,.64,1)}
 .mo.show .mo-box{transform:scale(1);opacity:1}
-.mo-title{font-family:'Cinzel',serif;font-size:14px;font-weight:700;margin-bottom:16px;color:var(--gold);letter-spacing:.06em}
-.mo-close{position:absolute;top:14px;right:14px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:30px;height:30px;border-radius:7px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px;}
-.qr-box{text-align:center;padding:20px;background:var(--surface3);border-radius:12px;border:1px solid var(--border);margin-top:12px}
+.mo-title{font-family:'Cinzel',serif;font-size:14px;font-weight:700;margin-bottom:16px;
+  color:var(--gold);letter-spacing:.06em}
+.mo-close{position:absolute;top:14px;right:14px;background:var(--surface3);border:1px solid var(--border);
+  color:var(--text3);width:30px;height:30px;border-radius:7px;cursor:pointer;display:flex;
+  align-items:center;justify-content:center;font-size:14px}
+.qr-box{text-align:center;padding:20px;background:var(--surface3);border-radius:12px;
+  border:1px solid var(--border);margin-top:12px}
 .qr-box img{max-width:200px;border-radius:8px;border:3px solid var(--border);box-shadow:var(--gold-glow)}
 .tb{display:flex;align-items:center;gap:7px;margin-bottom:14px;flex-wrap:wrap}
 .search-wrap{flex:1;min-width:160px;position:relative}
 .search-wrap svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--text3)}
-.search-wrap input{width:100%;padding:9px 12px 9px 34px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;font-family:inherit;outline:none;}
+.search-wrap input{width:100%;padding:9px 12px 9px 34px;background:var(--surface2);
+  border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;
+  font-family:inherit;outline:none}
+.search-wrap input:focus{border-color:var(--gold)}
 .filter-chips{display:flex;gap:3px;padding:3px;background:var(--surface2);border:1px solid var(--border);border-radius:8px}
-.chip{padding:7px 12px;border-radius:6px;font-size:11.5px;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;transition:all .18s;font-family:inherit}
+.chip{padding:7px 12px;border-radius:6px;font-size:11.5px;font-weight:700;color:var(--text3);
+  cursor:pointer;border:none;background:none;transition:all .18s;font-family:inherit}
 .chip.active{background:var(--gold);color:#000}
 .m-cards{display:none;flex-direction:column;gap:12px}
 .m-card{border:1px solid var(--border);border-radius:12px;padding:16px;background:var(--surface2)}
 .m-card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
 .m-card-acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
 .empty{text-align:center;padding:36px;color:var(--text3)}
-.mob-hd{display:none;position:fixed;top:0;left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);z-index:90;align-items:center;justify-content:space-between;backdrop-filter:blur(20px);}
-.mob-tl-group{display:flex;gap:10px;align-items:center;flex-direction:row;}
-.logout-mob{display:none;color:var(--red) !important;}
-.logout-mob:hover{background:var(--red-dim) !important;border-color:rgba(248,113,113,.3) !important;}
-
-/* Alerts and Log sections */
-.alerts-box {
-  background: rgba(248, 113, 113, 0.08);
-  border: 1px dashed rgba(248, 113, 113, 0.3);
-  border-radius: 12px;
-  padding: 14px;
-  margin-bottom: 14px;
-  display: none;
-}
-.alerts-title {
-  color: var(--red);
-  font-size: 12.5px;
-  font-weight: 700;
-  margin-bottom: 8px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.alert-item {
-  font-size: 12px;
-  margin-bottom: 4px;
-  color: var(--text);
-  display: flex;
-  justify-content: space-between;
-}
-.live-logs-container {
-  background: #000;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px;
-  font-family: monospace;
-  font-size: 11px;
-  color: #4ade80;
-  height: 200px;
-  overflow-y: auto;
-  white-space: pre-wrap;
-}
-
-/* Login page */
+.mob-hd{display:none;position:fixed;top:0;left:0;right:0;background:var(--surface);
+  border-bottom:1px solid var(--border);z-index:90;align-items:center;justify-content:space-between;
+  backdrop-filter:blur(20px)}
+.mob-tl-group{display:flex;gap:10px;align-items:center;flex-direction:row}
+.logout-mob{display:none;color:var(--red) !important}
+.logout-mob:hover{background:var(--red-dim) !important;border-color:rgba(248,113,113,.3) !important}
+.alerts-box{background:rgba(248,113,113,.08);border:1px dashed rgba(248,113,113,.3);
+  border-radius:12px;padding:14px;margin-bottom:14px;display:none}
+.alerts-title{color:var(--red);font-size:12.5px;font-weight:700;margin-bottom:8px;
+  display:flex;align-items:center;gap:6px}
+.alert-item{font-size:12px;margin-bottom:4px;color:var(--text);display:flex;justify-content:space-between}
+.live-logs-container{background:#000;border:1px solid var(--border);border-radius:8px;padding:12px;
+  font-family:monospace;font-size:11px;color:#FFD700;height:200px;overflow-y:auto;white-space:pre-wrap}
 .login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh;width:100%}
-.login-box{background:var(--surface2);border:1px solid var(--border2);border-radius:20px;padding:36px 32px;width:100%;max-width:360px;box-shadow:var(--gold-glow)}
+.login-box{background:var(--surface2);border:1px solid var(--border2);border-radius:20px;
+  padding:36px 32px;width:100%;max-width:360px;box-shadow:var(--gold-glow)}
 .login-logo{text-align:center;margin-bottom:28px}
 .login-title{font-family:'Cinzel',serif;font-size:22px;font-weight:900;color:var(--gold);letter-spacing:.1em}
 .login-sub{font-size:11px;color:var(--text3);margin-top:6px}
+
+/* Notification styles */
+.notif-item{display:flex;align-items:flex-start;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border);transition:all .2s}
+.notif-item:last-child{border-bottom:none}
+.notif-item:hover{background:var(--surface3)}
+.notif-item.unseen{background:var(--gold-dim)}
+.notif-icon{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:18px}
+.notif-icon.update{background:rgba(56,189,248,.12);color:#38bdf8}
+.notif-icon.quota{background:var(--red-dim);color:var(--red)}
+.notif-icon.expiry{background:rgba(251,191,36,.12);color:var(--yellow)}
+.notif-icon.info{background:rgba(74,222,128,.12);color:var(--green)}
+.notif-body{flex:1;min-width:0}
+.notif-title{font-size:13px;font-weight:700;color:var(--text);margin-bottom:2px}
+.notif-msg{font-size:11px;color:var(--text3);line-height:1.4}
+.notif-time{font-size:10px;color:var(--text3);margin-top:4px}
+.notif-link{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:600;color:var(--gold);text-decoration:none;margin-top:4px}
+.notif-link:hover{text-decoration:underline}
+.notif-dot{width:8px;height:8px;border-radius:50%;background:var(--gold);flex-shrink:0;margin-top:10px}
+
+/* Gold accent on progress fills */
+.pill-fill-gold{background:linear-gradient(90deg,var(--gold),var(--gold2))}
+
 @media(max-width:768px){
-  .mob-hd{display:flex;height:65px;padding:0 20px;}
-  .mob-tl-group .lang-btn{font-size:13px;padding:7px 10px;border-radius:8px;}
-  .theme-toggle{font-size:18px;padding:7px 10px;border-radius:8px;}
-  .mob-hd span{font-size:22px !important;}
-  .sidebar{transform:none !important;width:100% !important;height:78px;top:auto;bottom:0;border-right:none;border-top:1px solid var(--border);flex-direction:row;padding:0;background:var(--surface);box-shadow:0 -4px 20px rgba(0,0,0,0.5);}
-  .light-mode .sidebar{box-shadow:0 -4px 20px rgba(0,0,0,0.06);}
-  .sb-brand,.sb-bottom{display:none !important;}
-  .sb-nav{flex-direction:row;width:100%;padding:0;align-items:center;justify-content:space-between;gap:0;}
-  .nav-item{flex:1;padding:12px 0;border-radius:0;}
-  .nav-icon{width:24px;height:24px;margin-bottom:5px;}
-  .nav-label{font-size:10px;letter-spacing:0;}
-  .nav-badge{top:6px;right:50%;transform:translateX(10px);min-width:18px;height:18px;font-size:10px;}
-  .logout-mob{display:flex;}
-  .main{margin-left:0;padding-top:85px;padding-left:18px;padding-right:18px;padding-bottom:100px;}
-  .page-title{font-size:24px;}
-  .page-sub{font-size:13px;margin-top:5px;}
-  .btn{font-size:14px;padding:10px 18px;}
-  .btn-sm{font-size:12px;padding:8px 14px;}
-  .stats-row{grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px;}
-  .stat-card{padding:22px;border-radius:16px;}
-  .stat-label{font-size:12px;margin-bottom:12px;}
-  .stat-val{font-size:26px;}
-  .stat-unit{font-size:14px;}
-  .grid-2{grid-template-columns:1fr;gap:14px;margin-bottom:14px;}
-  .card{padding:22px;border-radius:16px;margin-bottom:14px;}
-  .card-title{font-size:16px;margin-bottom:16px;}
+  .mob-hd{display:flex;height:65px;padding:0 20px}
+  .mob-tl-group .lang-btn{font-size:13px;padding:7px 10px;border-radius:8px}
+  .theme-toggle{font-size:18px;padding:7px 10px;border-radius:8px}
+  .mob-hd span{font-size:22px !important}
+  .sidebar{transform:none !important;width:100% !important;height:78px;top:auto;bottom:0;
+    border-right:none;border-top:1px solid var(--border);flex-direction:row;padding:0;
+    background:var(--surface);box-shadow:0 -4px 20px rgba(0,0,0,.5)}
+  .light-mode .sidebar{box-shadow:0 -4px 20px rgba(0,0,0,.06)}
+  .sb-brand,.sb-bottom{display:none !important}
+  .sidebar .sb-social{display:none !important}
+  .mob-social{display:flex !important}
+  .sb-nav{flex-direction:row;width:100%;padding:0;align-items:center;justify-content:space-between;gap:0}
+  .nav-item{flex:1;padding:12px 0;border-radius:0}
+  .nav-icon{width:24px;height:24px;margin-bottom:5px}
+  .nav-label{font-size:10px;letter-spacing:0}
+  .nav-badge{top:6px;right:50%;transform:translateX(10px);min-width:18px;height:18px;font-size:10px}
+  .logout-mob{display:flex}
+  .main{margin-left:0;padding-top:85px;padding-left:18px;padding-right:18px;padding-bottom:100px}
+  .page-title{font-size:24px}
+  .page-sub{font-size:13px;margin-top:5px}
+  .btn{font-size:14px;padding:10px 18px}
+  .btn-sm{font-size:12px;padding:8px 14px}
+  .stats-row{grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px}
+  .stat-card{padding:22px;border-radius:16px}
+  .stat-label{font-size:12px;margin-bottom:12px}
+  .stat-val{font-size:26px}
+  .stat-unit{font-size:14px}
+  .grid-2{grid-template-columns:1fr;gap:14px;margin-bottom:14px}
+  .card{padding:22px;border-radius:16px;margin-bottom:14px}
+  .card-title{font-size:16px;margin-bottom:16px}
   .chart-container{height:220px;width:100%}
-  #cpu-v,#mem-v{font-size:22px !important;}
-  .sl-k,.sl-v{font-size:14px;padding:14px 0;}
+  #cpu-v,#mem-v{font-size:22px !important}
+  .sl-k,.sl-v{font-size:14px;padding:14px 0}
   .tbl-wrap{display:none}
-  .m-cards{display:flex;}
-  .m-card{padding:18px;border-radius:14px;}
-  .m-card-hd span{font-size:16px !important;}
-  .pill-used{font-size:13px;}
-  .pill-lim{font-size:12px;}
-  .m-card-acts .act-btn{font-size:12px;padding:8px 14px;border-radius:8px;}
-  .mo-box{padding:28px 24px;border-radius:20px;}
-  .fi,.fs{font-size:16px;padding:12px 16px;}
-  .fl{font-size:11px;margin-bottom:6px;}
+  .m-cards{display:flex}
+  .m-card{padding:18px;border-radius:14px}
+  .m-card-hd span{font-size:16px !important}
+  .pill-used{font-size:13px}
+  .pill-lim{font-size:12px}
+  .m-card-acts .act-btn{font-size:12px;padding:8px 14px;border-radius:8px}
+  .mo-box{padding:28px 24px;border-radius:20px}
+  .fi,.fs{font-size:16px;padding:12px 16px}
+  .fl{font-size:11px;margin-bottom:6px}
 }
-@media(max-width:460px){.stats-row{grid-template-columns:1fr;gap:14px;}}
+@media(max-width:460px){.stats-row{grid-template-columns:1fr;gap:14px}}
 </style>
 </head>
 <body>
@@ -1944,7 +3283,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <svg width="52" height="44" viewBox="0 0 84 68" fill="none">
           <ellipse cx="42" cy="52" rx="40" ry="11" fill="#C8900A" opacity=".85"/>
           <ellipse cx="42" cy="52" rx="40" ry="11" fill="none" stroke="#FFD700" stroke-width="1.4" opacity=".6"/>
-          <path d="M19 50 Q21 22 42 17 Q63 22 65 50" fill="#D4960C" stroke="#FFD700" stroke-width="1.4"/>
+          <path d="M19 50 Q21 22 42 17 Q63 22 65 50" fill="#4a3a00" stroke="#FFD700" stroke-width="1.4"/>
           <ellipse cx="42" cy="17" rx="23" ry="5.5" fill="#C8900A" stroke="#FFD700" stroke-width="1"/>
           <path d="M20 45 Q21.5 41.5 42 39.5 Q62.5 41.5 64 45" fill="none" stroke="#CC2200" stroke-width="4.5" stroke-linecap="round" opacity=".92"/>
         </svg>
@@ -1955,7 +3294,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <label class="fl">PASSWORD</label>
         <input class="fi" type="password" id="login-pw" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()">
       </div>
-      <button class="btn btn-gold" onclick="doLogin()" style="width:100%;justify-content:center;padding:12px;margin-top:6px;">LOGIN</button>
+      <button class="btn btn-gold" onclick="doLogin()" style="width:100%;justify-content:center;padding:12px;margin-top:6px">LOGIN</button>
       <div id="login-err" style="color:var(--red);font-size:12px;margin-top:10px;text-align:center;display:none">Invalid password</div>
     </div>
   </div>
@@ -1972,18 +3311,35 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <button class="lang-btn lang-en active" onclick="setLang('en')">EN</button>
         <button class="lang-btn lang-fa" onclick="setLang('fa')">FA</button>
       </div>
+      <div class="mob-social">
+        <a href="https://t.me/Luffy_sh_op" target="_blank" class="sb-social-btn" title="Telegram Channel">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.032 9.57c-.148.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12l-6.871 4.326-2.962-.924c-.643-.204-.657-.643.136-.953l11.57-4.461c.537-.194 1.006.131.895.651z"/></svg>
+        </a>
+        <a href="https://github.com/luffy-sh-op/LUFFY_PANEL/tree/main" target="_blank" class="sb-social-btn" title="GitHub">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.374 0 0 5.373 0 12c0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0112 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z"/></svg>
+        </a>
+      </div>
     </div>
-    <span style="font-family:'Cinzel',serif;font-size:16px;font-weight:700;color:var(--gold);letter-spacing:1px;">LUFFY</span>
+    <span style="font-family:'Cinzel',serif;font-size:16px;font-weight:700;color:var(--gold);letter-spacing:2px">LUFFY</span>
   </div>
 
   <!-- SIDEBAR -->
   <aside class="sidebar" id="sb">
+    <!-- Telegram & GitHub links (above the LUFFY logo) -->
+    <div class="sb-social" style="padding:10px 8px 0">
+      <a href="https://t.me/Luffy_sh_op" target="_blank" class="sb-social-btn" title="Telegram Channel">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.032 9.57c-.148.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12l-6.871 4.326-2.962-.924c-.643-.204-.657-.643.136-.953l11.57-4.461c.537-.194 1.006.131.895.651z"/></svg>
+      </a>
+      <a href="https://github.com/luffy-sh-op/LUFFY_PANEL/tree/main" target="_blank" class="sb-social-btn" title="GitHub">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.374 0 0 5.373 0 12c0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0112 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z"/></svg>
+      </a>
+    </div>
     <div class="sb-brand">
       <div class="sb-hat">
         <svg width="36" height="30" viewBox="0 0 84 68" fill="none">
           <ellipse cx="42" cy="52" rx="40" ry="11" fill="#C8900A" opacity=".85"/>
           <ellipse cx="42" cy="52" rx="40" ry="11" fill="none" stroke="#FFD700" stroke-width="1.4" opacity=".6"/>
-          <path d="M19 50 Q21 22 42 17 Q63 22 65 50" fill="#D4960C" stroke="#FFD700" stroke-width="1.4"/>
+          <path d="M19 50 Q21 22 42 17 Q63 22 65 50" fill="#4a3a00" stroke="#FFD700" stroke-width="1.4"/>
           <ellipse cx="42" cy="17" rx="23" ry="5.5" fill="#C8900A" stroke="#FFD700" stroke-width="1"/>
           <path d="M20 45 Q21.5 41.5 42 39.5 Q62.5 41.5 64 45" fill="none" stroke="#CC2200" stroke-width="4.5" stroke-linecap="round" opacity=".92"/>
           <ellipse cx="35" cy="24" rx="5" ry="3" fill="rgba(255,255,255,.1)" transform="rotate(-20 35 24)"/>
@@ -2009,9 +3365,18 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
         <span class="nav-label" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span>
       </button>
+      <button class="nav-item" data-page="notifications">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 01-3.46 0"/></svg>
+        <span class="nav-label" data-en="Notifications" data-fa="اعلانات">Notifications</span>
+        <span class="nav-badge" id="notif-badge" style="display:none">0</span>
+      </button>
       <button class="nav-item" data-page="security">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
         <span class="nav-label" data-en="Security" data-fa="امنیت">Security</span>
+      </button>
+      <button class="nav-item" data-page="settings">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+        <span class="nav-label" data-en="Settings" data-fa="تنظیمات">Settings</span>
       </button>
       <button class="nav-item logout-mob" onclick="doLogout()">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -2039,11 +3404,10 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <div class="page-header">
         <div>
           <div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div>
-          <div class="page-sub" id="last-up">–</div>
+          <div class="page-sub" id="last-up">-</div>
         </div>
       </div>
 
-      <!-- Critical alerts section -->
       <div class="alerts-box" id="alerts-box">
         <div class="alerts-title">
           <span>⚠️</span>
@@ -2053,18 +3417,18 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       </div>
 
       <div class="stats-row">
-        <div class="stat-card" style="animation-delay:.08s"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
-        <div class="stat-card" style="animation-delay:.16s"><div class="stat-label" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="stat-val" id="sv-links">–</div></div>
-        <div class="stat-card" style="animation-delay:.24s"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:15px">–</div></div>
-        <div class="stat-card" style="animation-delay:.32s"><div class="stat-label" data-en="Domain" data-fa="دامنه">Domain</div><div class="stat-val" id="sv-domain" style="font-size:10px;word-break:break-all;font-weight:500">–</div></div>
+        <div class="stat-card" style="animation-delay:.08s"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">-<span class="stat-unit"> MB</span></div></div>
+        <div class="stat-card" style="animation-delay:.16s"><div class="stat-label" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="stat-val" id="sv-links">-</div></div>
+        <div class="stat-card" style="animation-delay:.24s"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:15px">-</div></div>
+        <div class="stat-card" style="animation-delay:.32s"><div class="stat-label" data-en="Domain" data-fa="دامنه">Domain</div><div class="stat-val" id="sv-domain" style="font-size:10px;word-break:break-all;font-weight:500">-</div></div>
       </div>
       <div class="grid-2">
         <div class="card">
-          <div class="card-hd"><div class="card-title" data-en="CPU" data-fa="پردازنده">CPU</div><span id="cpu-v" style="font-size:17px;font-weight:700;color:var(--gold)">–%</span></div>
+          <div class="card-hd"><div class="card-title" data-en="CPU" data-fa="پردازنده">CPU</div><span id="cpu-v" style="font-size:17px;font-weight:700;color:var(--gold)">-%</span></div>
           <div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--gold)"></div></div>
         </div>
         <div class="card">
-          <div class="card-hd"><div class="card-title" data-en="Memory" data-fa="حافظه">Memory</div><span id="mem-v" style="font-size:17px;font-weight:700;color:var(--green)">–%</span></div>
+          <div class="card-hd"><div class="card-title" data-en="Memory" data-fa="حافظه">Memory</div><span id="mem-v" style="font-size:17px;font-weight:700;color:var(--green)">-%</span></div>
           <div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--green)"></div></div>
         </div>
       </div>
@@ -2098,7 +3462,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <div class="tbl-wrap">
           <table class="tbl">
             <thead><tr>
-              <th data-en="#" data-fa="#">#</th>
+              <th>#</th>
               <th data-en="Name" data-fa="نام">Name</th>
               <th data-en="Type" data-fa="نوع">Type</th>
               <th data-en="Usage" data-fa="مصرف">Usage</th>
@@ -2120,13 +3484,29 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <div class="page-header"><div><div class="page-title" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="page-sub" data-en="Statistics & Inbound comparison" data-fa="آمار و مقایسه مصرف کاربران">Statistics & Inbound comparison</div></div></div>
       <div class="grid-2" style="margin-bottom:14px">
         <div class="card">
-          <div class="sl-item"><span class="sl-k" data-en="Total Traffic" data-fa="کل ترافیک">Total Traffic</span><span class="sl-v" id="t-tr">–</span></div>
-          <div class="sl-item"><span class="sl-k" data-en="Total Requests" data-fa="کل درخواست‌ها">Total Requests</span><span class="sl-v" id="t-rq">–</span></div>
-          <div class="sl-item"><span class="sl-k" data-en="Uptime" data-fa="آپتایم">Uptime</span><span class="sl-v" id="t-up">–</span></div>
+          <div class="sl-item"><span class="sl-k" data-en="Total Traffic" data-fa="کل ترافیک">Total Traffic</span><span class="sl-v" id="t-tr">-</span></div>
+          <div class="sl-item"><span class="sl-k" data-en="Total Requests" data-fa="کل درخواست‌ها">Total Requests</span><span class="sl-v" id="t-rq">-</span></div>
+          <div class="sl-item"><span class="sl-k" data-en="Uptime" data-fa="آپتایم">Uptime</span><span class="sl-v" id="t-up">-</span></div>
         </div>
         <div class="card">
           <div class="card-hd"><div class="card-title" data-en="Inbound Traffic Share" data-fa="سهم ترافیک کاربران">Inbound Traffic Share</div></div>
           <div class="chart-container"><canvas id="inbound-chart"></canvas></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Notifications -->
+    <section class="page" id="page-notifications">
+      <div class="page-header">
+        <div><div class="page-title" data-en="Notifications" data-fa="اعلانات">Notifications</div><div class="page-sub" data-en="Updates, alerts & system messages" data-fa="بروزرسانی‌ها، هشدارها و پیام‌های سیستم">Updates, alerts & system messages</div></div>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-ghost btn-sm" onclick="markAllSeen()" data-en="Mark all read" data-fa="خوانده شدن همه">Mark all read</button>
+          <button class="btn btn-danger btn-sm" onclick="clearNotifs()" data-en="Clear all" data-fa="حذف همه">Clear all</button>
+        </div>
+      </div>
+      <div class="card" style="padding:0;overflow:hidden">
+        <div id="notif-list" style="padding:4px 0">
+          <div class="empty" data-en="No notifications" data-fa="هیچ اعلانی وجود ندارد">No notifications</div>
         </div>
       </div>
     </section>
@@ -2152,20 +3532,71 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <div class="grid-2">
         <div class="card">
           <div class="card-hd"><div class="card-title" data-en="Telegram Bot Settings" data-fa="تنظیمات ربات تلگرام">Telegram Bot Settings</div></div>
-          <div class="fg"><label class="fl" data-en="Telegram Bot Token" data-fa="توکن ربات تلگرام">Bot Token</label><input class="fi" type="text" id="tg-token" placeholder="123456:ABC-DEF..."></div>
-          <div class="fg"><label class="fl" data-en="Telegram Admin ID" data-fa="شناسه عددی ادمین">Admin Chat ID</label><input class="fi" type="text" id="tg-admin-id" placeholder="987654321"></div>
-          <button class="btn btn-gold" onclick="saveSettings()" style="margin-top:10px;width:100%;justify-content:center;" data-en="Save Bot Settings" data-fa="ذخیره تنظیمات ربات">Save Bot Settings</button>
+          <div class="fg"><label class="fl" data-en="Bot Token" data-fa="توکن ربات">Bot Token</label><input class="fi" type="text" id="tg-token" placeholder="123456:ABC-DEF..."></div>
+          <div class="fg"><label class="fl" data-en="Admin Chat ID" data-fa="شناسه ادمین">Admin Chat ID</label><input class="fi" type="text" id="tg-admin-id" placeholder="987654321"></div>
+          <button class="btn btn-gold" onclick="saveSettings()" style="margin-top:10px;width:100%;justify-content:center" data-en="Save & Restart Bot" data-fa="ذخیره و ریستارت ربات">Save & Restart Bot</button>
         </div>
         <div class="card">
           <div class="card-hd"><div class="card-title" data-en="Change Password" data-fa="تغییر رمز عبور">Change Password</div></div>
-          <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw" data-ph-en="Current password" data-ph-fa="رمز فعلی" placeholder="Current password"></div>
-          <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw" data-ph-en="Min 4 chars" data-ph-fa="حداقل ۴ کاراکتر" placeholder="Min 4 chars"></div>
-          <button class="btn btn-gold" onclick="chgPw()" style="margin-top:10px;width:100%;justify-content:center;" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
+          <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw" placeholder="Current password"></div>
+          <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw" placeholder="Min 4 chars"></div>
+          <button class="btn btn-gold" onclick="chgPw()" style="margin-top:10px;width:100%;justify-content:center" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
         </div>
       </div>
-      <div class="card" style="margin-top: 14px;">
+      <div class="card" style="margin-top:14px">
         <div class="card-hd"><div class="card-title" data-en="Live Logs" data-fa="لاگ‌های زنده">Live Logs</div></div>
-        <div class="live-logs-container" id="log-container">Initializing live logs connection...</div>
+        <div class="live-logs-container" id="log-container">Connecting to live logs...</div>
+      </div>
+    </section>
+
+    <!-- Settings -->
+    <section class="page" id="page-settings">
+      <div class="page-header"><div><div class="page-title" data-en="Settings" data-fa="تنظیمات">Settings</div><div class="page-sub" data-en="Railway Permanent Database & Preferences" data-fa="دیتابیس دائمی Railway و تنظیمات">Railway Permanent Database & Preferences</div></div></div>
+
+      <!-- Permanent Database -->
+      <div class="card" style="border:1px solid rgba(129,140,248,0.25)">
+        <div class="card-hd">
+          <div class="card-title" style="color:#818cf8">💾 <span data-en="Permanent Database" data-fa="دیتابیس دائمی">Permanent Database</span></div>
+          <span id="rdb-status" style="font-size:11px;color:var(--text3)">-</span>
+        </div>
+        <div style="font-size:11px;color:var(--text3);margin-bottom:12px;line-height:1.5" data-en="Connect to Railway, select a project and ensure a persistent volume at /data exists for permanent storage." data-fa="به Railway متصل شوید، یک پروژه انتخاب کنید و مطمئن شوید یک volume پایدار در مسیر /data وجود دارد.">
+          Connect to Railway, select a project and ensure a persistent volume at /data exists for permanent storage.
+        </div>
+        <div class="fg">
+          <label class="fl" data-en="Railway Token" data-fa="توکن Railway">Railway Token</label>
+          <div style="display:flex;gap:8px">
+            <input class="fi" type="password" id="rw-token" placeholder="rly_..." style="flex:1">
+            <button class="btn btn-ghost btn-sm" onclick="fetchRailwayProjects()" id="rw-fetch-btn" data-en="Fetch" data-fa="دریافت">Fetch</button>
+          </div>
+        </div>
+        <div class="fg">
+          <label class="fl" data-en="Project" data-fa="پروژه">Project</label>
+          <select class="fs" id="rw-project" disabled>
+            <option value="" data-en="-- Select a project --" data-fa="-- پروژه را انتخاب کنید --">-- Select a project --</option>
+          </select>
+        </div>
+        <div class="fg" id="rw-volume-info" style="display:none">
+          <div style="display:flex;align-items:center;gap:10px;padding:12px;border-radius:8px;border:1px solid var(--border)" id="rw-volume-box">
+            <span id="rw-volume-icon" style="font-size:20px">❓</span>
+            <div>
+              <div id="rw-volume-title" style="font-weight:600;font-size:13px">-</div>
+              <div id="rw-volume-desc" style="font-size:11px;color:var(--text3);margin-top:2px">-</div>
+            </div>
+            <button class="btn btn-gold btn-sm" id="rw-create-btn" style="margin-left:auto;display:none" onclick="createRailwayVolume()" data-en="Create Volume" data-fa="ایجاد Volume">Create Volume</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Bot Settings (moved here too) -->
+      <div class="card">
+        <div class="card-hd"><div class="card-title" data-en="Telegram Bot" data-fa="ربات تلگرام">Telegram Bot</div></div>
+        <div class="fg"><label class="fl" data-en="Bot Token" data-fa="توکن ربات">Bot Token</label><input class="fi" type="text" id="rw-tg-token" placeholder="123456:ABC-DEF..."></div>
+        <div class="fg"><label class="fl" data-en="Admin Chat ID" data-fa="شناسه ادمین">Admin Chat ID</label><input class="fi" type="text" id="rw-tg-admin" placeholder="987654321"></div>
+        <div class="fg" style="display:flex;align-items:center;gap:8px;margin-top:4px">
+          <input type="checkbox" id="rw-tg-notify-conn" style="width:16px;height:16px;accent-color:var(--gold)">
+          <label for="rw-tg-notify-conn" style="font-size:12px;cursor:pointer" data-en="Notify on every connect / disconnect" data-fa="اعلان هر ورود و خروج (اتصال و قطع اتصال) کاربران">Notify on every connect / disconnect</label>
+        </div>
+        <button class="btn btn-gold" onclick="saveAllSettings()" style="margin-top:10px;width:100%;justify-content:center" data-en="Save All Settings" data-fa="ذخیره همه تنظیمات">Save All Settings</button>
       </div>
     </section>
 
@@ -2179,12 +3610,12 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     <div class="mo-title" data-en="ADD INBOUND" data-fa="افزودن اینباند">ADD INBOUND</div>
     <div class="fg"><label class="fl" data-en="Remark" data-fa="توضیح">Remark</label><input class="fi" id="nl" data-ph-en="e.g. User 1" data-ph-fa="مثلاً کاربر ۱" placeholder="e.g. User 1"></div>
     <div class="fr">
-      <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+      <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step=".1" placeholder="0 = ∞"></div>
       <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu"><option>GB</option></select></div>
     </div>
-    <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-    <div class="fg"><label class="fl" data-en="Days Valid" data-fa="روزهای اعتبار">Days Valid</label><input class="fi" id="nd" type="number" min="0" data-ph-en="0 = No expiry" data-ph-fa="۰ = بدون انقضا" placeholder="0 = No expiry"></div>
-    <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en="CREATE" data-fa="ایجاد">CREATE</button>
+    <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" placeholder="0 = ∞"></div>
+    <div class="fg"><label class="fl" data-en="Days Valid" data-fa="روزهای اعتبار">Days Valid</label><input class="fi" id="nd" type="number" min="0" placeholder="0 = No expiry"></div>
+    <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px" data-en="CREATE" data-fa="ایجاد">CREATE</button>
   </div>
 </div>
 
@@ -2195,14 +3626,14 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     <input type="hidden" id="eu">
     <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="en2" readonly style="opacity:.5;cursor:not-allowed"></div>
     <div class="fr">
-      <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="el" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+      <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="el" type="number" min="0" step=".1" placeholder="0 = ∞"></div>
       <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div>
     </div>
-    <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-    <div class="fg"><label class="fl" data-en="Extend Days" data-fa="افزایش روزها">Extend Days</label><input class="fi" id="ed" type="number" min="0" data-ph-en="0 = no change" data-ph-fa="۰ = بدون تغییر" placeholder="0 = no change"></div>
+    <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0" placeholder="0 = ∞"></div>
+    <div class="fg"><label class="fl" data-en="Extend Days" data-fa="افزایش روزها">Extend Days</label><input class="fi" id="ed" type="number" min="0" placeholder="0 = no change"></div>
     <div style="display:flex;gap:10px;margin-top:16px">
-      <button class="btn btn-gold" onclick="saveEdit()" style="flex:1;justify-content:center;padding:12px;" data-en="SAVE" data-fa="ذخیره">SAVE</button>
-      <button class="btn btn-danger" onclick="resetTraf()" style="padding:12px;" data-en="Reset" data-fa="بازنشانی ترافیک">Reset</button>
+      <button class="btn btn-gold" onclick="saveEdit()" style="flex:1;justify-content:center;padding:12px" data-en="SAVE" data-fa="ذخیره">SAVE</button>
+      <button class="btn btn-danger" onclick="resetTraf()" style="padding:12px" data-en="Reset" data-fa="بازنشانی">Reset</button>
     </div>
   </div>
 </div>
@@ -2213,8 +3644,8 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     <div class="mo-title" data-en="QR CODE" data-fa="کد QR">QR CODE</div>
     <div class="qr-box"><img id="qr-img" src="" alt="QR"></div>
     <div style="display:flex;gap:10px;margin-top:16px;justify-content:center">
-      <button class="btn btn-gold btn-sm" onclick="dlQR()" style="padding:10px 16px;" data-en="Download" data-fa="دانلود">Download</button>
-      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('mo-qr').classList.remove('show')" style="padding:10px 16px;" data-en="Close" data-fa="بستن">Close</button>
+      <button class="btn btn-gold btn-sm" onclick="dlQR()" style="padding:10px 16px" data-en="Download" data-fa="دانلود">Download</button>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('mo-qr').classList.remove('show')" style="padding:10px 16px" data-en="Close" data-fa="بستن">Close</button>
     </div>
   </div>
 </div>
@@ -2223,21 +3654,21 @@ body[dir="rtl"]{direction:rtl;text-align:right}
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-addr').classList.remove('show')">✕</button>
     <div class="mo-title" data-en="ADD CLEAN IP" data-fa="افزودن آی‌پی تمیز">ADD CLEAN IP</div>
-    <div class="fg"><label class="fl" data-en="IPs / Domains (one per line)" data-fa="آی‌پی‌ها / دامنه‌ها (هر خط یک)">IPs / Domains</label><textarea class="fi" id="na" rows="5" data-ph-en="8.8.8.8&#10;example.com" data-ph-fa="۸.۸.۸.۸&#10;example.com" placeholder="8.8.8.8&#10;example.com" style="resize:vertical;font-family:monospace"></textarea></div>
-    <button class="btn btn-gold" onclick="addAddrs()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en="ADD ALL" data-fa="افزودن همه">ADD ALL</button>
+    <div class="fg"><label class="fl" data-en="IPs / Domains (one per line)" data-fa="آی‌پی‌ها (هر خط یک)">IPs / Domains</label><textarea class="fi" id="na" rows="5" placeholder="8.8.8.8&#10;example.com" style="resize:vertical;font-family:monospace"></textarea></div>
+    <button class="btn btn-gold" onclick="addAddrs()" style="width:100%;justify-content:center;margin-top:12px;padding:12px" data-en="ADD ALL" data-fa="افزودن همه">ADD ALL</button>
   </div>
 </div>
 
 <script>
-function $(s){return document.querySelector(s);}
-function $m(id){return document.getElementById(id);}
-function esc(s){return String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function $(s){return document.querySelector(s)}
+function $m(id){return document.getElementById(id)}
+function esc(s){return String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 
 const langMap={
-  en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},
-  fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذف'}
+  en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del',gh:'View on GitHub'},
+  fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذف',gh:'مشاهده در گیت‌هاب'}
 };
-function tr(key){return(langMap[lang]&&langMap[lang][key])||langMap['en'][key]||key;}
+function tr(key){return(langMap[lang]&&langMap[lang][key])||langMap['en'][key]||key}
 
 let lang=localStorage.getItem('ll')||'en';
 let theme=localStorage.getItem('theme')||'dark';
@@ -2246,12 +3677,25 @@ let cf='all';
 let sData={};
 let tChart=null;
 let iChart=null;
+
+// Generates visually distinct colors using the golden-angle rotation so that
+// adjacent chart segments never look alike, regardless of how many users exist.
+function genDistinctColors(n){
+  const colors=[];
+  const GOLDEN_ANGLE=137.508;
+  const startHue=45; // start near gold to match theme, then spread out
+  for(let i=0;i<n;i++){
+    const hue=(startHue+i*GOLDEN_ANGLE)%360;
+    const sat=70+((i*17)%20);   // 70-90%
+    const light=48+((i*11)%16); // 48-64%
+    colors.push(`hsl(${hue.toFixed(1)},${sat}%,${light}%)`);
+  }
+  return colors;
+}
 let allAddrs=[];
 let isAuthenticated=false;
-let defaultPort=443;
 let logsWS=null;
 
-// ── Theme ────────────────────────────────────────────────────────────────────
 function setTheme(t){
   theme=t;
   if(t==='light')document.body.classList.add('light-mode');
@@ -2264,9 +3708,8 @@ function setTheme(t){
   if(db)db.innerHTML=icon+' Theme';
   updChartColors();
 }
-function toggleTheme(){setTheme(theme==='dark'?'light':'dark');}
+function toggleTheme(){setTheme(theme==='dark'?'light':'dark')}
 
-// ── Lang ─────────────────────────────────────────────────────────────────────
 function setLang(l){
   lang=l;
   document.querySelectorAll('.lang-en').forEach(e=>e.classList.toggle('active',l==='en'));
@@ -2284,39 +3727,27 @@ function setLang(l){
   filterLinks();
 }
 
-// ── Live Logs WebSocket ───────────────────────────────────────────────────────
 function connectLogsWS(){
-  if(logsWS) { try { logsWS.close(); } catch(e){} }
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const token = document.cookie.split('; ').find(row => row.startsWith('ren_session='))?.split('=')[1];
-  if(!token) return;
-  logsWS = new WebSocket(`${protocol}//${location.host}/ws/live-logs?token=${token}`);
-  logsWS.onmessage = function(e){
-    const container = $m('log-container');
-    if(container){
-      container.textContent += e.data + '\n';
-      container.scrollTop = container.scrollHeight;
-    }
+  if(logsWS){try{logsWS.close()}catch(e){}}
+  const protocol=location.protocol==='https:'?'wss:':'ws:';
+  const token=document.cookie.split('; ').find(r=>r.startsWith('ren_session='))?.split('=')[1];
+  if(!token)return;
+  logsWS=new WebSocket(`${protocol}//${location.host}/ws/live-logs?token=${token}`);
+  logsWS.onmessage=function(e){
+    const c=$m('log-container');
+    if(c){c.textContent+=e.data+'\n';c.scrollTop=c.scrollHeight}
   };
-  logsWS.onerror = function(){
-    $m('log-container').textContent = "Live log connection error. Reconnecting...";
-  };
-  logsWS.onclose = function(){
-    setTimeout(connectLogsWS, 5000);
-  };
+  logsWS.onerror=function(){$m('log-container').textContent='Connection error. Reconnecting...'};
+  logsWS.onclose=function(){setTimeout(connectLogsWS,5000)};
 }
 
-// ── Auth ─────────────────────────────────────────────────────────────────────
 async function checkAuth(){
   try{
     const r=await fetch('/api/me');
     const d=await r.json();
-    if(d.authenticated){
-      showDashboard();
-    } else {
-      showLogin();
-    }
-  } catch(e){showLogin();}
+    if(d.authenticated)showDashboard();
+    else showLogin();
+  }catch(e){showLogin()}
 }
 
 function showLogin(){
@@ -2334,6 +3765,8 @@ function showDashboard(){
   loadLinks();
   loadAddrs();
   loadSettings();
+  loadNotifs();
+  updateNotifBadge();
   connectLogsWS();
 }
 
@@ -2341,18 +3774,10 @@ async function doLogin(){
   const pw=$m('login-pw').value;
   $m('login-err').style.display='none';
   try{
-    const r=await fetch('/api/login',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({password:pw})
-    });
-    if(r.ok){
-      $m('login-pw').value='';
-      showDashboard();
-    } else {
-      $m('login-err').style.display='block';
-    }
-  } catch(e){$m('login-err').style.display='block';}
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+    if(r.ok){$m('login-pw').value='';showDashboard()}
+    else $m('login-err').style.display='block';
+  }catch(e){$m('login-err').style.display='block'}
 }
 
 async function doLogout(){
@@ -2360,7 +3785,6 @@ async function doLogout(){
   showLogin();
 }
 
-// ── Navigation ───────────────────────────────────────────────────────────────
 document.querySelectorAll('.nav-item[data-page]').forEach(el=>{
   el.addEventListener('click',()=>switchPage(el.dataset.page));
 });
@@ -2372,7 +3796,6 @@ function switchPage(id){
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
 }
 
-// ── Toast ─────────────────────────────────────────────────────────────────────
 function toast(msg,err=false){
   const t=$m('toast');
   t.textContent=msg;
@@ -2381,12 +3804,10 @@ function toast(msg,err=false){
   t._hide=setTimeout(()=>t.classList.remove('show'),3000);
 }
 
-// ── Format helpers ────────────────────────────────────────────────────────────
 function fmtB(b){
   if(!b||b===0)return'0 B';
   return b>=1073741824?(b/1073741824).toFixed(2)+' GB':
-         b>=1048576?(b/1048576).toFixed(2)+' MB':
-         (b/1024).toFixed(1)+' KB';
+         b>=1048576?(b/1048576).toFixed(2)+' MB':(b/1024).toFixed(1)+' KB';
 }
 function fmtLim(b){
   if(!b||b===0)return'∞';
@@ -2404,7 +3825,6 @@ function fmtExp(ea){
   return Math.floor(d/60000)+'m';
 }
 
-// ── Links ─────────────────────────────────────────────────────────────────────
 function setFilter(filter,el){
   cf=filter;
   document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));
@@ -2422,49 +3842,35 @@ function filterLinks(){
 }
 
 function processAlertsAndCharts(){
-  const alertsList = $m('alerts-list');
-  const alertsBox = $m('alerts-box');
-  alertsList.innerHTML = '';
-  let alertCount = 0;
+  const alertsList=$m('alerts-list');
+  const alertsBox=$m('alerts-box');
+  alertsList.innerHTML='';
+  let alertCount=0;
 
-  allLinks.forEach(l => {
-    const u = l.used_bytes || 0;
-    const lim = l.limit_bytes || 0;
-    const pct = lim > 0 ? (u / lim) * 100 : 0;
-    
-    if(lim > 0 && pct >= 90){
+  allLinks.forEach(l=>{
+    const u=l.used_bytes||0;
+    const lim=l.limit_bytes||0;
+    const pct=lim>0?(u/lim)*100:0;
+    if(lim>0&&pct>=90){
       alertCount++;
-      alertsList.innerHTML += `
-        <div class="alert-item">
-          <span style="font-weight:600;">🔴 Inbound '${esc(l.label)}' is near quota limit:</span>
-          <span>${pct.toFixed(1)}% Used</span>
-        </div>`;
+      alertsList.innerHTML+=`<div class="alert-item"><span style="font-weight:600">🔴 '${esc(l.label)}' near limit:</span><span>${pct.toFixed(1)}% Used</span></div>`;
     }
-    
     if(l.expires_at){
-      const diff = new Date(l.expires_at) - new Date();
-      const days = diff / 86400000;
-      if(days > 0 && days <= 3){
+      const diff=new Date(l.expires_at)-new Date();
+      const days=diff/86400000;
+      if(days>0&&days<=3){
         alertCount++;
-        alertsList.innerHTML += `
-          <div class="alert-item">
-            <span style="font-weight:600;">🟡 Inbound '${esc(l.label)}' will expire soon:</span>
-            <span>${days.toFixed(1)} Days Left</span>
-          </div>`;
+        alertsList.innerHTML+=`<div class="alert-item"><span style="font-weight:600">🟡 '${esc(l.label)}' expiring soon:</span><span>${days.toFixed(1)} Days</span></div>`;
       }
     }
   });
-
-  if(alertCount > 0){
-    alertsBox.style.display = 'block';
-  } else {
-    alertsBox.style.display = 'none';
-  }
+  alertsBox.style.display=alertCount>0?'block':'none';
 
   if(iChart){
-    const sorted = [...allLinks].sort((a,b)=>(b.used_bytes||0)-(a.used_bytes||0)).slice(0, 8);
-    iChart.data.labels = sorted.map(x=>x.label);
-    iChart.data.datasets[0].data = sorted.map(x=>Math.round((x.used_bytes||0)/(1024*1024)));
+    const sorted=[...allLinks].sort((a,b)=>(b.used_bytes||0)-(a.used_bytes||0)).slice(0,8);
+    iChart.data.labels=sorted.map(x=>x.label);
+    iChart.data.datasets[0].data=sorted.map(x=>Math.round((x.used_bytes||0)/(1024*1024)));
+    iChart.data.datasets[0].backgroundColor=genDistinctColors(sorted.length);
     iChart.update();
   }
 }
@@ -2474,11 +3880,8 @@ function renderLinks(links){
   const em=$m('lempty');
   const mc=$m('mcards');
   if(!links||!links.length){
-    tb.innerHTML='';
-    mc.innerHTML='';
-    em.style.display='block';
-    const emptyText=em.getAttribute('data-'+lang)||em.getAttribute('data-en')||'No inbounds found';
-    em.textContent=emptyText;
+    tb.innerHTML='';mc.innerHTML='';em.style.display='block';
+    em.textContent=em.getAttribute('data-'+lang)||'No inbounds found';
     return;
   }
   em.style.display='none';
@@ -2549,39 +3952,28 @@ async function togLink(el){
   if(!l)return;
   const na=!l.active;
   try{
-    const r=await fetch('/api/links/'+uid,{
-      method:'PATCH',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({active:na})
-    });
+    const r=await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});
     if(!r.ok)throw new Error();
-    l.active=na;
-    filterLinks();
-    loadStats();
-  }catch(e){toast('Failed to toggle',true);}
+    l.active=na;filterLinks();loadStats();
+  }catch(e){toast('Failed to toggle',true)}
 }
 
-function showAddMo(){$m('mo-add').classList.add('show');}
+function showAddMo(){$m('mo-add').classList.add('show')}
 
 async function createLink(){
   const label=$m('nl').value.trim()||'New Link';
-  if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true);return;}
+  if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true);return}
   const v=parseFloat($m('nv').value)||0;
   const mc=parseInt($m('nc').value)||0;
   const days=parseInt($m('nd').value)||0;
   try{
-    const r=await fetch('/api/links',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})
-    });
+    const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})});
     if(!r.ok)throw new Error();
     toast('Created');
     $m('nl').value='';$m('nv').value='';$m('nc').value='';$m('nd').value='';
     $m('mo-add').classList.remove('show');
-    await loadLinks();
-    await loadStats();
-  }catch(e){toast('Error creating link',true);}
+    await loadLinks();await loadStats();
+  }catch(e){toast('Error creating link',true)}
 }
 
 function showEditMo(uid){
@@ -2604,31 +3996,20 @@ async function saveEdit(){
   const body={limit_value:v,limit_unit:'GB',max_connections:mc};
   if(days>0)body.days_valid=days;
   try{
-    const r=await fetch('/api/links/'+uid,{
-      method:'PATCH',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(body)
-    });
+    const r=await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!r.ok)throw new Error();
-    toast('Updated');
-    $m('mo-edit').classList.remove('show');
-    await loadLinks();
-  }catch(e){toast('Error updating',true);}
+    toast('Updated');$m('mo-edit').classList.remove('show');await loadLinks();
+  }catch(e){toast('Error updating',true)}
 }
 
 async function resetTraf(){
   const uid=$m('eu').value;
   if(!confirm('Reset traffic for this inbound?'))return;
   try{
-    const r=await fetch('/api/links/'+uid,{
-      method:'PATCH',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({reset_usage:true})
-    });
+    const r=await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});
     if(!r.ok)throw new Error();
-    toast('Traffic reset');
-    await loadLinks();
-  }catch(e){toast('Error resetting',true);}
+    toast('Traffic reset');await loadLinks();
+  }catch(e){toast('Error resetting',true)}
 }
 
 async function delLink(uid){
@@ -2636,14 +4017,12 @@ async function delLink(uid){
   try{
     const r=await fetch('/api/links/'+uid,{method:'DELETE'});
     if(!r.ok)throw new Error();
-    toast('Deleted');
-    await loadLinks();
-    await loadStats();
-  }catch(e){toast('Error deleting',true);}
+    toast('Deleted');await loadLinks();await loadStats();
+  }catch(e){toast('Error deleting',true)}
 }
 
 function cpLink(txt){
-  if(!txt){toast('No link to copy',true);return;}
+  if(!txt){toast('No link to copy',true);return}
   navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed to copy',true));
 }
 
@@ -2651,153 +4030,221 @@ async function cpSub(uid){
   try{
     await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);
     toast('Sub URL copied!');
-  }catch(e){toast('Failed to copy',true);}
+  }catch(e){toast('Failed to copy',true)}
 }
 
 function showQR(txt){
-  if(!txt){toast('No QR data',true);return;}
+  if(!txt){toast('No QR data',true);return}
   $m('qr-img').src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);
   $m('mo-qr').classList.add('show');
 }
 
 function dlQR(){
   const a=document.createElement('a');
-  a.href=$m('qr-img').src;
-  a.download='luffy-qr.png';
-  a.click();
+  a.href=$m('qr-img').src;a.download='luffy-qr.png';a.click();
 }
 
-// ── Stats & Settings API ──────────────────────────────────────────────────────
 async function loadSettings(){
-  try {
-    const r = await fetch('/api/settings');
-    if (r.ok) {
-      const d = await r.json();
-      $m('tg-token').value = d.telegram_token || '';
-      $m('tg-admin-id').value = d.telegram_admin_id || '';
+  try{
+    const r=await fetch('/api/settings');
+    if(r.ok){const d=await r.json();
+      $m('tg-token').value=d.telegram_token||'';
+      $m('tg-admin-id').value=d.telegram_admin_id||'';
+      if($m('rw-tg-token'))$m('rw-tg-token').value=d.telegram_token||'';
+      if($m('rw-tg-admin'))$m('rw-tg-admin').value=d.telegram_admin_id||'';
+      if($m('rw-token'))$m('rw-token').value=d.railway_token||'';
+      if($m('rw-tg-notify-conn'))$m('rw-tg-notify-conn').checked=!!d.notify_connections;
     }
-  } catch(e){}
+  }catch(e){}
 }
 
 async function saveSettings(){
-  const tok = $m('tg-token').value.trim();
-  const adm = $m('tg-admin-id').value.trim();
-  try {
-    const r = await fetch('/api/settings', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({telegram_token: tok, telegram_admin_id: adm})
-    });
-    if (r.ok) {
-      toast('Bot settings saved & restarted');
-    } else {
-      toast('Failed to save settings', true);
-    }
-  } catch(e){toast('Error saving settings', true);}
+  const tok=$m('tg-token').value.trim();
+  const adm=$m('tg-admin-id').value.trim();
+  try{
+    const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({telegram_token:tok,telegram_admin_id:adm})});
+    if(r.ok)toast('Bot settings saved & restarted');
+    else toast('Failed to save settings',true);
+  }catch(e){toast('Error saving settings',true)}
 }
+
+async function saveAllSettings(){
+  const tok=($m('rw-tg-token')?.value||'').trim();
+  const adm=($m('rw-tg-admin')?.value||'').trim();
+  const rwt=($m('rw-token')?.value||'').trim();
+  const notifyConn=!!($m('rw-tg-notify-conn')?.checked);
+  try{
+    const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({telegram_token:tok,telegram_admin_id:adm,railway_token:rwt,notify_connections:notifyConn})});
+    if(r.ok)toast('All settings saved');
+    else toast('Failed to save settings',true);
+  }catch(e){toast('Error saving settings',true)}
+}
+
+// ── Railway / Permanent Database ──────────────────────────────────────────
+
+async function fetchRailwayProjects(){
+  const token=$m('rw-token').value.trim();
+  if(!token){toast('Enter your Railway token first',true);return}
+  const btn=$m('rw-fetch-btn');
+  const sel=$m('rw-project');
+  btn.disabled=true;btn.textContent='Loading...';
+  sel.disabled=true;sel.innerHTML='<option>Loading...</option>';
+  $m('rw-volume-info').style.display='none';
+  try{
+    const r=await fetch('/api/railway/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token})});
+    if(!r.ok)throw new Error((await r.json()).detail||'Error');
+    const d=await r.json();
+    sel.innerHTML='<option value="">-- Select a project --</option>'+d.projects.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('');
+    sel.disabled=false;
+    toast('Found '+d.projects.length+' project(s)');
+  }catch(e){toast(e.message||'Failed to fetch projects',true);sel.innerHTML='<option value="">Error loading</option>'}
+  finally{btn.disabled=false;btn.textContent=btn.getAttribute('data-'+lang)||'Fetch'}
+}
+
+async function checkRailwayVolume(){
+  const token=$m('rw-token').value.trim();
+  const pid=$m('rw-project').value;
+  if(!token||!pid){toast('Select a project first',true);return}
+  const info=$m('rw-volume-info');
+  const icon=$m('rw-volume-icon');
+  const title=$m('rw-volume-title');
+  const desc=$m('rw-volume-desc');
+  const cbtn=$m('rw-create-btn');
+  info.style.display='';icon.textContent='⏳';title.textContent='Checking...';desc.textContent='';cbtn.style.display='none';
+  try{
+    const r=await fetch('/api/railway/volume-status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token,project_id:pid})});
+    if(!r.ok)throw new Error((await r.json()).detail||'Error');
+    const d=await r.json();
+    const hasData=d.has_data_volume;
+    if(hasData){
+      icon.textContent='✅';icon.style.color='var(--green)';
+      title.textContent='Volume at /data exists!';
+      const v=d.volumes.find(x=>x.path==='data'||x.path==='/data')||d.volumes[0];
+      desc.textContent=(v?'ID: '+v.id+' | Name: '+v.name+' | State: '+v.state:'');
+      cbtn.style.display='none';
+      $m('rdb-status').textContent='✅ Active';$m('rdb-status').style.color='var(--green)';
+    }else{
+      // No volume found - create it automatically, no manual click needed.
+      icon.textContent='⏳';title.textContent='No volume found, creating one automatically...';desc.textContent='';
+      $m('rdb-status').textContent='⏳ Creating...';$m('rdb-status').style.color='var(--gold)';
+      await createRailwayVolume(true);
+    }
+  }catch(e){toast(e.message||'Failed to check',true);info.style.display='none'}
+}
+
+async function createRailwayVolume(silent){
+  const token=$m('rw-token').value.trim();
+  const pid=$m('rw-project').value;
+  if(!token||!pid){toast('Select a project first',true);return}
+  const icon=$m('rw-volume-icon');
+  const title=$m('rw-volume-title');
+  const desc=$m('rw-volume-desc');
+  const cbtn=$m('rw-create-btn');
+  cbtn.disabled=true;cbtn.textContent='Creating...';
+  try{
+    const r=await fetch('/api/railway/create-volume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token,project_id:pid})});
+    if(!r.ok)throw new Error((await r.json()).detail||'Error');
+    if(!silent)toast('Volume created successfully!');
+    else toast('/data volume created automatically');
+    icon.textContent='✅';icon.style.color='var(--green)';
+    title.textContent='Volume at /data created!';
+    desc.textContent='It may take a few seconds to finish provisioning.';
+    cbtn.style.display='none';
+    $m('rdb-status').textContent='✅ Active';$m('rdb-status').style.color='var(--green)';
+  }catch(e){
+    icon.textContent='❌';icon.style.color='var(--red)';
+    title.textContent='No volume at /data found';
+    desc.textContent=e.message||'Failed to auto-create volume. Click below to retry.';
+    cbtn.style.display='';
+    $m('rdb-status').textContent='❌ Missing';$m('rdb-status').style.color='var(--red)';
+    toast(e.message||'Failed to create volume',true);
+  }
+  finally{cbtn.disabled=false;cbtn.textContent=cbtn.getAttribute('data-'+lang)||'Create Volume'}
+}
+
+// Auto-check volume when project selection changes
+document.addEventListener('change',function(e){
+  if(e.target.id==='rw-project'&&e.target.value){
+    checkRailwayVolume();
+  }
+});
 
 async function loadStats(){
   try{
     const r=await fetch('/stats');
-    if(r.status===401){showLogin();return;}
+    if(r.status===401){showLogin();return}
     if(!r.ok)throw new Error();
     sData=await r.json();
     $m('sv-traffic').innerHTML=(sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>';
     $m('sv-links').textContent=sData.links_count||0;
-    $m('sv-uptime').textContent=sData.uptime||'–';
-    $m('sv-domain').textContent=sData.domain||'–';
+    $m('sv-uptime').textContent=sData.uptime||'-';
+    $m('sv-domain').textContent=sData.domain||'-';
     $m('nb').textContent=sData.links_count||0;
     $m('last-up').textContent='Updated '+new Date().toLocaleTimeString();
     if($m('t-tr'))$m('t-tr').textContent=(sData.total_traffic_mb||0)+' MB';
     if($m('t-rq'))$m('t-rq').textContent=(sData.total_requests||0).toLocaleString();
-    if($m('t-up'))$m('t-up').textContent=sData.uptime||'–';
+    if($m('t-up'))$m('t-up').textContent=sData.uptime||'-';
     if(sData.cpu_percent!==undefined){
       const c=sData.cpu_percent;
       const cc=c>80?'var(--red)':c>50?'var(--yellow)':'var(--gold)';
-      $m('cpu-v').textContent=c.toFixed(1)+'%';
-      $m('cpu-v').style.color=cc;
-      $m('cpu-b').style.width=c+'%';
-      $m('cpu-b').style.background=cc;
+      $m('cpu-v').textContent=c.toFixed(1)+'%';$m('cpu-v').style.color=cc;
+      $m('cpu-b').style.width=c+'%';$m('cpu-b').style.background=cc;
     }
     if(sData.memory_percent!==undefined){
       const m=sData.memory_percent;
       const mc=m>80?'var(--red)':m>50?'var(--yellow)':'var(--green)';
-      $m('mem-v').textContent=m.toFixed(1)+'%';
-      $m('mem-v').style.color=mc;
-      $m('mem-b').style.width=m+'%';
-      $m('mem-b').style.background=mc;
+      $m('mem-v').textContent=m.toFixed(1)+'%';$m('mem-v').style.color=mc;
+      $m('mem-b').style.width=m+'%';$m('mem-b').style.background=mc;
     }
     updChart();
-  }catch(e){/* silent */}
+  }catch(e){}
 }
 
 async function loadLinks(){
   try{
     const r=await fetch('/api/links');
-    if(r.status===401){showLogin();return;}
+    if(r.status===401){showLogin();return}
     if(!r.ok)throw new Error();
     const d=await r.json();
-    allLinks=d.links||[];
-    filterLinks();
-  }catch(e){/* silent */}
+    allLinks=d.links||[];filterLinks();
+  }catch(e){}
 }
 
 async function chgPw(){
-  const cur=$m('cpw').value;
-  const nw=$m('npw').value;
-  if(!cur||!nw){toast('Fill all fields',true);return;}
-  if(nw.length<4){toast('Password must be at least 4 characters',true);return;}
+  const cur=$m('cpw').value;const nw=$m('npw').value;
+  if(!cur||!nw){toast('Fill all fields',true);return}
+  if(nw.length<4){toast('Password must be at least 4 characters',true);return}
   try{
-    const r=await fetch('/api/change-password',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({current_password:cur,new_password:nw})
-    });
-    if(!r.ok){
-      const d=await r.json().catch(()=>({}));
-      throw new Error(d.detail||'Error changing password');
-    }
-    toast('Password updated successfully');
-    $m('cpw').value='';$m('npw').value='';
-  }catch(e){toast(e.message,true);}
+    const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});
+    if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'Error')}
+    toast('Password updated');$m('cpw').value='';$m('npw').value='';
+  }catch(e){toast(e.message,true)}
 }
 
-// ── Chart ─────────────────────────────────────────────────────────────────────
 function initChart(){
   const ctx=$m('tc');
   if(!ctx||tChart)return;
   tChart=new Chart(ctx,{
     type:'bar',
-    data:{
-      labels:[],
-      datasets:[{label:'MB',data:[],backgroundColor:'rgba(255,215,0,0.55)',borderColor:'#FFD700',borderWidth:1,borderRadius:4}]
-    },
-    options:{
-      responsive:true,maintainAspectRatio:false,
+    data:{labels:[],datasets:[{label:'MB',data:[],backgroundColor:'rgba(255,215,0,0.4)',borderColor:'#FFD700',borderWidth:1,borderRadius:4}]},
+    options:{responsive:true,maintainAspectRatio:false,
       plugins:{legend:{display:false}},
       scales:{
-        x:{grid:{display:false},ticks:{color:'rgba(255,215,0,0.3)',font:{size:10}}},
-        y:{grid:{color:'rgba(255,255,255,0.04)'},ticks:{color:'rgba(255,215,0,0.3)',font:{size:10},callback:v=>v+' MB'},beginAtZero:true}
+        x:{grid:{display:false},ticks:{color:'rgba(255,215,0,0.35)',font:{size:10}}},
+        y:{grid:{color:'rgba(255,215,0,0.06)'},ticks:{color:'rgba(255,215,0,0.35)',font:{size:10},callback:v=>v+' MB'},beginAtZero:true}
       }
     }
   });
 
   const ctx2=$m('inbound-chart');
-  if(ctx2 && !iChart){
+  if(ctx2&&!iChart){
     iChart=new Chart(ctx2,{
       type:'doughnut',
-      data:{
-        labels:[],
-        datasets:[{
-          data:[],
-          backgroundColor:['#FFD700','#a78bfa','#4ade80','#fbbf24','#f87171','#38bdf8','#ec4899','#f43f5e'],
-          borderWidth:0
-        }]
-      },
-      options:{
-        responsive:true,maintainAspectRatio:false,
-        plugins:{legend:{display:true,position:'right',labels:{color:'rgba(255,255,255,0.6)',font:{size:10}}}}
-      }
+      data:{labels:[],datasets:[{data:[],
+        backgroundColor:[],
+        borderWidth:0}]},
+      options:{responsive:true,maintainAspectRatio:false,
+        plugins:{legend:{display:true,position:'right',labels:{color:'rgba(255,255,255,0.6)',font:{size:10}}}}}
     });
   }
   updChartColors();
@@ -2805,8 +4252,8 @@ function initChart(){
 
 function updChartColors(){
   if(!tChart)return;
-  const col=theme==='light'?'rgba(0,0,0,0.5)':'rgba(255,215,0,0.4)';
-  const gridCol=theme==='light'?'rgba(0,0,0,0.08)':'rgba(255,255,255,0.06)';
+  const col=theme==='light'?'rgba(0,0,0,0.4)':'rgba(255,215,0,0.35)';
+  const gridCol=theme==='light'?'rgba(0,0,0,0.06)':'rgba(255,215,0,0.06)';
   tChart.options.scales.x.ticks.color=col;
   tChart.options.scales.y.ticks.color=col;
   tChart.options.scales.y.grid.color=gridCol;
@@ -2815,59 +4262,118 @@ function updChartColors(){
 
 function updChart(){
   if(!tChart||!sData.hourly_traffic)return;
-  const entries=Object.entries(sData.hourly_traffic)
-    .sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);
-  tChart.data.labels=entries.map(x=>x[0]);
+  const entries=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);
+  tChart.data.labels=entries.map(x=>{const p=x[0].split(' ');return p.length>1?p[1]:p[0]});
   tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));
   tChart.update();
 }
 
-// ── Addresses ─────────────────────────────────────────────────────────────────
 async function loadAddrs(){
   try{
     const r=await fetch('/api/addresses');
     if(!r.ok)throw new Error();
-    const d=await r.json();
-    allAddrs=d.addresses||[];
-    renderAddrs();
-  }catch(e){/* silent */}
+    const d=await r.json();allAddrs=d.addresses||[];renderAddrs();
+  }catch(e){}
 }
 
 function renderAddrs(){
   const el=$m('addr-list');
   if(!el)return;
-  if(!allAddrs||!allAddrs.length){
-    el.innerHTML='<div style="color:var(--text3);font-size:12px">No addresses added</div>';
-    return;
-  }
+  if(!allAddrs||!allAddrs.length){el.innerHTML='<div style="color:var(--text3);font-size:12px">No addresses added</div>';return}
   el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
     <div style="display:flex;align-items:center;gap:10px">
       <span style="color:var(--gold);font-size:16px">🌐</span>
-      <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px;">Address #${i+1}</div></div>
+      <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px">Address #${i+1}</div></div>
     </div>
     <button class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</button>
   </div>`).join('');
 }
 
-function showAddAddrMo(){$m('na').value='';$m('mo-addr').classList.add('show');}
+function showAddAddrMo(){$m('na').value='';$m('mo-addr').classList.add('show')}
+
+// ── Notifications ────────────────────────────────────────────────────────
+const NOTIF_ICONS = {update:'🔔',quota:'⚠️',expiry:'⏰',info:'ℹ️'};
+
+async function loadNotifs(){
+  try{
+    const r=await fetch('/api/notifications');
+    if(r.status===401)return;
+    if(!r.ok)return;
+    const d=await r.json();
+    renderNotifs(d.notifications||[]);
+  }catch(e){}
+}
+
+function renderNotifs(notifs){
+  const el=$m('notif-list');
+  if(!el)return;
+  if(!notifs||!notifs.length){
+    el.innerHTML='<div class="empty" style="padding:32px">'+(lang==='fa'?'هیچ اعلانی وجود ندارد':'No notifications')+'</div>';
+    return;
+  }
+  el.innerHTML=notifs.map(n=>{
+    const icon=NOTIF_ICONS[n.type]||'ℹ️';
+    const cls=n.seen?'':'unseen';
+    const time=new Date(n.created_at).toLocaleString();
+    const linkHtml=n.link?`<a href="${esc(n.link)}" target="_blank" class="notif-link">${tr('gh')} ↗</a>`:'';
+    return `<div class="notif-item ${cls}" onclick="markSeen(${n.id})">
+      <div class="notif-icon ${n.type}">${icon}</div>
+      <div class="notif-body">
+        <div class="notif-title">${esc(n.title)}</div>
+        <div class="notif-msg">${esc(n.message)}</div>
+        <div class="notif-time">${time}</div>
+        ${linkHtml}
+      </div>
+      ${n.seen?'':'<div class="notif-dot"></div>'}
+    </div>`;
+  }).join('');
+}
+
+async function markSeen(id){
+  await fetch('/api/notifications/'+id+'/seen',{method:'POST'});
+  await loadNotifs();
+  await updateNotifBadge();
+}
+
+async function markAllSeen(){
+  await fetch('/api/notifications/seen-all',{method:'POST'});
+  await loadNotifs();
+  await updateNotifBadge();
+}
+
+async function clearNotifs(){
+  if(!confirm(lang==='fa'?'حذف همه اعلانات؟':'Clear all notifications?'))return;
+  await fetch('/api/notifications',{method:'DELETE'});
+  await loadNotifs();
+  await updateNotifBadge();
+}
+
+async function updateNotifBadge(){
+  try{
+    const r=await fetch('/api/notifications/count');
+    if(!r.ok)return;
+    const d=await r.json();
+    const badge=$m('notif-badge');
+    if(badge){
+      if(d.count>0){badge.style.display='';badge.textContent=d.count}
+      else{badge.style.display='none'}
+    }
+  }catch(e){}
+}
 
 async function addAddrs(){
   const lines=($m('na').value||'').trim().split('\n').map(l=>l.trim()).filter(l=>l);
   let ok=0,fail=0;
   for(const a of lines){
-    if(!/^[a-zA-Z0-9\-_. ]+$/.test(a)){fail++;continue;}
+    if(!/^[a-zA-Z0-9\-_. ]+$/.test(a)){fail++;continue}
     try{
-      const r=await fetch('/api/addresses',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({address:a})
-      });
+      const r=await fetch('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:a})});
       if(r.ok)ok++;else fail++;
-    }catch(e){fail++;}
+    }catch(e){fail++}
   }
   if(ok)toast('Added '+ok);
   if(fail)toast(fail+' failed',true);
-  if(ok){$m('mo-addr').classList.remove('show');await loadAddrs();}
+  if(ok){$m('mo-addr').classList.remove('show');await loadAddrs()}
 }
 
 async function delAddr(i){
@@ -2875,32 +4381,64 @@ async function delAddr(i){
   try{
     const r=await fetch('/api/addresses/'+i,{method:'DELETE'});
     if(!r.ok)throw new Error();
-    toast('Deleted');
-    await loadAddrs();
-  }catch(e){toast('Error deleting',true);}
+    toast('Deleted');await loadAddrs();
+  }catch(e){toast('Error deleting',true)}
 }
 
 async function delAllAddrs(){
-  if(!allAddrs||!allAddrs.length){toast('No addresses to delete',true);return;}
-  if(!confirm('Delete ALL clean IP addresses? This cannot be undone.'))return;
+  if(!allAddrs||!allAddrs.length){toast('No addresses to delete',true);return}
+  if(!confirm('Delete ALL clean IP addresses?'))return;
   try{
     const r=await fetch('/api/addresses',{method:'DELETE'});
     if(!r.ok)throw new Error();
-    toast('All addresses deleted');
-    await loadAddrs();
-  }catch(e){toast('Error deleting',true);}
+    toast('All addresses deleted');await loadAddrs();
+  }catch(e){toast('Error deleting',true)}
 }
 
-// ── Init ──────────────────────────────────────────────────────────────────────
 setTheme(theme);
 setLang(lang);
 checkAuth();
 let statsInterval=null;
 function startPolling(){
   if(statsInterval)clearInterval(statsInterval);
-  statsInterval=setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();}},12000);
+  statsInterval=setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();updateNotifBadge()}},12000);
 }
 startPolling();
+
+// ── Panel update notifications (checks GitHub for new releases) ────────
+const PANEL_VERSION_KEY='luffy_panel_last_version';
+const PANEL_GH_NOTIFIED_KEY='luffy_panel_last_notified_gh';
+let loadedPanelVersion=null;
+
+async function checkPanelVersion(isPeriodic){
+  try{
+    const r=await fetch('/api/version');
+    if(!r.ok)return;
+    const d=await r.json();
+    const serverVersion=d.version;
+
+    // Detect that this panel instance was updated since the last time we visited
+    if(!loadedPanelVersion){
+      loadedPanelVersion=serverVersion;
+      const lastSeen=localStorage.getItem(PANEL_VERSION_KEY);
+      if(lastSeen&&lastSeen!==serverVersion){
+        toast('✅ Panel updated successfully to v'+serverVersion);
+      }
+      localStorage.setItem(PANEL_VERSION_KEY,serverVersion);
+    }
+
+    // Detect that GitHub has a newer release than what's currently running
+    if(d.update_available&&d.latest_github_version){
+      const alreadyNotified=localStorage.getItem(PANEL_GH_NOTIFIED_KEY);
+      if(alreadyNotified!==d.latest_github_version){
+        toast('🚀 New version available on GitHub: '+d.latest_github_version+' - pull the latest update');
+        localStorage.setItem(PANEL_GH_NOTIFIED_KEY,d.latest_github_version);
+      }
+    }
+  }catch(e){}
+}
+checkPanelVersion(false);
+setInterval(()=>checkPanelVersion(true),5*60*1000);
 </script>
 </body>
 </html>"""
