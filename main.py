@@ -43,7 +43,7 @@ class QueueHandler(logging.Handler):
             pass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("Luffy-Gateway")
+logger = logging.getLogger("VROOM-Gateway")
 
 q_handler = QueueHandler()
 q_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
@@ -51,7 +51,7 @@ logger.addHandler(q_handler)
 logging.getLogger("uvicorn.error").addHandler(q_handler)
 logging.getLogger("uvicorn.access").addHandler(q_handler)
 
-app = FastAPI(title="Luffy Panel", docs_url=None, redoc_url=None)
+app = FastAPI(title="VROOM Panel", docs_url=None, redoc_url=None)
 
 # Bump this on every release so the dashboard can notify already-open sessions
 # that a new version is available / was just applied.
@@ -200,7 +200,7 @@ def _get_or_create_secret() -> str:
     return new_secret
 
 CONFIG = {
-    "port": int(os.environ.get("PORT", 8000)),
+    "port": int(os.environ.get("PORT", 8080)),
     "secret": _get_or_create_secret(),
     "telegram_token": "",
     "telegram_admin_id": "",
@@ -229,7 +229,7 @@ CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
 
 notified_uids = set()
 
-SESSION_COOKIE = "ren_session"
+SESSION_COOKIE = "vroom_session"
 SESSION_TTL = 60 * 60 * 24 * 7
 UNLIMITED_QUOTA_BYTES = 53687091200000
 DEFAULT_PORT = 443
@@ -251,7 +251,7 @@ BOT_I18N = {
         "btn_create": "➕ Create User",
         "btn_addip": "🌐 Add Clean IP",
         "btn_lang": "فارسی",
-        "welcome": "👑 <b>Welcome to Luffy Panel Telegram Bot!</b>\nManage your VLESS inbounds directly from your Telegram.",
+        "welcome": "👑 <b>Welcome to VROOM Panel Telegram Bot!</b>\nManage your VLESS inbounds directly from your Telegram.",
         "lang_switched": "🌐 Language switched to <b>English</b>.",
         "stats": (
             "<b>📊 Server Status Dashboard</b>\n\n"
@@ -334,7 +334,7 @@ BOT_I18N = {
         "btn_create": "➕ ساخت کاربر",
         "btn_addip": "🌐 افزودن آی‌پی تمیز",
         "btn_lang": "English",
-        "welcome": "👑 <b>به ربات تلگرامی پنل لافی خوش اومدی!</b>\nاینباندهای VLESS رو مستقیم از تلگرام مدیریت کن.",
+        "welcome": "👑 <b>به ربات تلگرامی پنل ورووم خوش اومدی!</b>\nاینباندهای VLESS رو مستقیم از تلگرام مدیریت کن.",
         "lang_switched": "🌐 زبان به <b>فارسی</b> تغییر یافت.",
         "stats": (
             "<b>📊 وضعیت سرور</b>\n\n"
@@ -709,7 +709,7 @@ def get_domain() -> str:
         .replace("https://", "").replace("http://", "")
     )
 
-def generate_vless_link(uuid: str, remark: str = "Luffy", address: str = None, port: int = None) -> str:
+def generate_vless_link(uuid: str, remark: str = "VROOM", address: str = None, port: int = None) -> str:
     domain = get_domain()
     addr = address if address else domain
     use_port = port if port else DEFAULT_PORT
@@ -1146,7 +1146,7 @@ async def handle_create_command(text: str):
         }
 
     await save_db()
-    vless_link = generate_vless_link(uid, remark=f"Luffy-{label}", port=DEFAULT_PORT)
+    vless_link = generate_vless_link(uid, remark=f"VROOM-{label}", port=DEFAULT_PORT)
     sub_url = f"https://{get_domain()}/sub/{uid}"
 
     quota_str = _fmt_bytes(limit_bytes) if limit_bytes > 0 else L("unlimited")
@@ -1615,7 +1615,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": LINKS[uid]["created_at"],
         "expires_at": expires_at,
-        "vless_link": generate_vless_link(uid, remark=f"Luffy-{label}", port=DEFAULT_PORT),
+        "vless_link": generate_vless_link(uid, remark=f"VROOM-{label}", port=DEFAULT_PORT),
     }
 
 @app.get("/api/links")
@@ -1634,7 +1634,7 @@ async def list_links(_=Depends(require_auth)):
             "created_at": data["created_at"],
             "expires_at": data.get("expires_at"),
             "current_connections": await count_connections_for_link(uid),
-            "vless_link": generate_vless_link(uid, remark=f"Luffy-{data['label']}", port=DEFAULT_PORT),
+            "vless_link": generate_vless_link(uid, remark=f"VROOM-{data['label']}", port=DEFAULT_PORT),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
@@ -1817,9 +1817,9 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
         if exp_dt:
             expiry_date_str = exp_dt.strftime("%d %b %Y").upper()
 
-    configs = [generate_vless_link(uid, remark=f"Luffy-{link['label']}", port=DEFAULT_PORT)]
+    configs = [generate_vless_link(uid, remark=f"VROOM-{link['label']}", port=DEFAULT_PORT)]
     for i, addr in enumerate(addresses):
-        configs.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}-IP{i+1}", address=addr, port=DEFAULT_PORT))
+        configs.append(generate_vless_link(uid, remark=f"VROOM-{link['label']}-IP{i+1}", address=addr, port=DEFAULT_PORT))
 
     # Sub URL for QR
     sub_url = f"https://{get_domain()}/sub/{uid}"
@@ -1844,7 +1844,7 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Luffy - {link['label']}</title>
+    <title>VROOM - {link['label']}</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
     <style>
         *{{margin:0;padding:0;box-sizing:border-box}}
@@ -2037,7 +2037,7 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
             box-shadow:var(--gold-glow)}}
         .toast.show{{opacity:1;transform:translateX(-50%) translateY(0)}}
 
-        /* Luffy footer links */
+        /* VROOM footer links */
         .footer-links{{display:flex;justify-content:center;gap:16px;padding:20px 0 10px}}
         .footer-link{{display:flex;align-items:center;gap:5px;color:var(--text3);
             font-size:11px;font-weight:600;text-decoration:none;transition:color .2s}}
@@ -2063,7 +2063,7 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
                 <ellipse cx="42" cy="17" rx="23" ry="5.5" fill="#C8900A" stroke="#FFD700" stroke-width="1"/>
                 <path d="M20 45 Q21.5 41.5 42 39.5 Q62.5 41.5 64 45" fill="none" stroke="#CC2200" stroke-width="4.5" stroke-linecap="round" opacity=".92"/>
             </svg>
-            <span class="header-title">LUFFY</span>
+            <span class="header-title">VROOM</span>
         </div>
         <div class="header-sub">{link['label']} · Connection Status</div>
     </div>
@@ -2190,7 +2190,7 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
     // The #name fragment is what Hiddify shows as the profile name before
     // it even fetches the sublink, and is used as a fallback if the
     // content's own #profile-title header is missing or fails to parse.
-    const hiddifyProfileName = encodeURIComponent("Luffy-{link['label']}");
+    const hiddifyProfileName = encodeURIComponent("VROOM-{link['label']}");
     const hiddifyImportUrl = "hiddify://import/" + subUrl + "#" + hiddifyProfileName;
 
     // Returns URL to the PNG icon for the given app name.
@@ -2369,7 +2369,7 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
     function downloadQR() {{
         const a = document.createElement('a');
         a.href = document.getElementById('qr-modal-img').src;
-        a.download = 'luffy-config-qr.png';
+        a.download = 'vroom-config-qr.png';
         a.click();
     }}
 
@@ -2451,9 +2451,9 @@ def generate_subscription_content(link: dict, uid: str, addresses: list[str]) ->
         expiry_str = f"{secs_left // 86400} Days Left"
     
     links_out = []
-    links_out.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}", port=DEFAULT_PORT))
+    links_out.append(generate_vless_link(uid, remark=f"VROOM-{link['label']}", port=DEFAULT_PORT))
     for i, addr in enumerate(addresses):
-        links_out.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}-IP{i+1}", address=addr, port=DEFAULT_PORT))
+        links_out.append(generate_vless_link(uid, remark=f"VROOM-{link['label']}-IP{i+1}", address=addr, port=DEFAULT_PORT))
             
     return "\n".join(links_out)
 
@@ -2484,10 +2484,10 @@ def generate_singbox_config(link: dict, uid: str, addresses: list[str]) -> str:
             },
         }
 
-    tags = [f"Luffy-{link['label']}"]
+    tags = [f"VROOM-{link['label']}"]
     outbounds = [_vless_outbound(tags[0], domain)]
     for i, addr in enumerate(addresses):
-        tag = f"Luffy-{link['label']}-IP{i+1}"
+        tag = f"VROOM-{link['label']}-IP{i+1}"
         tags.append(tag)
         outbounds.append(_vless_outbound(tag, addr))
 
@@ -2538,15 +2538,15 @@ def generate_clash_config(link: dict, uid: str, addresses: list[str]) -> str:
         )
 
     proxies = []
-    proxies.append(_proxy_entry(f"Luffy-{link['label']}", domain))
+    proxies.append(_proxy_entry(f"VROOM-{link['label']}", domain))
     for i, addr in enumerate(addresses):
-        proxies.append(_proxy_entry(f"Luffy-{link['label']}-IP{i+1}", addr))
+        proxies.append(_proxy_entry(f"VROOM-{link['label']}-IP{i+1}", addr))
 
     proxies_yaml = "\n".join(proxies)
-    proxy_names = "\n".join(f'      - "{p}"' for p in [f"Luffy-{link['label']}"] + [f"Luffy-{link['label']}-IP{i+1}" for i in range(len(addresses))])
+    proxy_names = "\n".join(f'      - "{p}"' for p in [f"VROOM-{link['label']}"] + [f"VROOM-{link['label']}-IP{i+1}" for i in range(len(addresses))])
 
     return (
-        f"# Luffy Panel - {link['label']}\n"
+        f"# VROOM Panel - {link['label']}\n"
         f"# {usage_str} | {expiry_str}\n"
         f"port: 7890\n"
         f"socks-port: 7891\n"
@@ -2652,7 +2652,7 @@ async def subscription_endpoint(uid: str, request: Request):
     headers = {
         "Content-Type": "text/plain; charset=utf-8",
         "profile-update-interval": "6",
-        "profile-title": "base64:" + base64.b64encode(f"Luffy-{link['label']}".encode()).decode(),
+        "profile-title": "base64:" + base64.b64encode(f"VROOM-{link['label']}".encode()).decode(),
         "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={total_bytes}; expire={expire_ts}",
     }
 
@@ -2969,7 +2969,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Luffy Panel</title>
+<title>VROOM Panel</title>
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
@@ -3287,7 +3287,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
           <ellipse cx="42" cy="17" rx="23" ry="5.5" fill="#C8900A" stroke="#FFD700" stroke-width="1"/>
           <path d="M20 45 Q21.5 41.5 42 39.5 Q62.5 41.5 64 45" fill="none" stroke="#CC2200" stroke-width="4.5" stroke-linecap="round" opacity=".92"/>
         </svg>
-        <div class="login-title">LUFFY PANEL</div>
+        <div class="login-title">VROOM PANEL</div>
         <div class="login-sub">Enter your password to continue</div>
       </div>
       <div class="fg">
@@ -3320,12 +3320,12 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         </a>
       </div>
     </div>
-    <span style="font-family:'Cinzel',serif;font-size:16px;font-weight:700;color:var(--gold);letter-spacing:2px">LUFFY</span>
+    <span style="font-family:'Cinzel',serif;font-size:16px;font-weight:700;color:var(--gold);letter-spacing:2px">VROOM</span>
   </div>
 
   <!-- SIDEBAR -->
   <aside class="sidebar" id="sb">
-    <!-- Telegram & GitHub links (above the LUFFY logo) -->
+    <!-- Telegram & GitHub links (above the VROOM logo) -->
     <div class="sb-social" style="padding:10px 8px 0">
       <a href="https://t.me/Luffy_sh_op" target="_blank" class="sb-social-btn" title="Telegram Channel">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.032 9.57c-.148.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12l-6.871 4.326-2.962-.924c-.643-.204-.657-.643.136-.953l11.57-4.461c.537-.194 1.006.131.895.651z"/></svg>
@@ -3345,7 +3345,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
           <ellipse cx="35" cy="24" rx="5" ry="3" fill="rgba(255,255,255,.1)" transform="rotate(-20 35 24)"/>
         </svg>
       </div>
-      <div class="sb-title">LUFFY</div>
+      <div class="sb-title">VROOM</div>
     </div>
     <nav class="sb-nav">
       <button class="nav-item active" data-page="dashboard">
@@ -3720,7 +3720,7 @@ function setLang(l){
     if(v)el.textContent=v;
   });
   document.querySelectorAll('[data-ph-en]').forEach(el=>{
-    const v=el.getAttribute('data-ph-'+l);
+    const v=el.getAttribute('data-'+l);
     if(v)el.placeholder=v;
   });
   localStorage.setItem('ll',l);
@@ -4041,7 +4041,7 @@ function showQR(txt){
 
 function dlQR(){
   const a=document.createElement('a');
-  a.href=$m('qr-img').src;a.download='luffy-qr.png';a.click();
+  a.href=$m('qr-img').src;a.download='vroom-qr.png';a.click();
 }
 
 async function loadSettings(){
@@ -4406,8 +4406,8 @@ function startPolling(){
 startPolling();
 
 // ── Panel update notifications (checks GitHub for new releases) ────────
-const PANEL_VERSION_KEY='luffy_panel_last_version';
-const PANEL_GH_NOTIFIED_KEY='luffy_panel_last_notified_gh';
+const PANEL_VERSION_KEY='vroom_panel_last_version';
+const PANEL_GH_NOTIFIED_KEY='vroom_panel_last_notified_gh';
 let loadedPanelVersion=null;
 
 async function checkPanelVersion(isPeriodic){
